@@ -556,7 +556,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
             // at `/widgets/index` — where `/widgets/:id` answers it as a
             // show — under the name of the resource's own helper.
             let own_path = *action_symbol && canonical_action(path, route_scope);
-            let (nested, base_params) = nest_path(
+            let (nested, _) = nest_path(
                 if own_path { "" } else { path },
                 &ctx.parents,
                 route_scope.unwrap_or(*scope),
@@ -641,7 +641,7 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     && short.iter().zip(long.iter()).all(|(a, b)| a == b)
             };
             let required_count = {
-                let mut p = base_params.clone();
+                let mut p = Vec::new();
                 let shortest = if trailing_optionals { variants.last() } else { variants.first() };
                 extract_path_params(shortest.unwrap(), &mut p);
                 p.len()
@@ -669,7 +669,10 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 .map(|(name, rx)| (name.as_str().to_string(), rx.clone()))
                 .collect();
             for (i, vpath) in variants.into_iter().enumerate() {
-                let mut params = base_params.clone();
+                // In path order, as Rails takes positional helper args: a
+                // dynamic scope (`scope ":slug"`) leads the nesting's own
+                // segments (`preview_post_path(slug, id)`).
+                let mut params = Vec::new();
                 extract_path_params(&vpath, &mut params);
                 let required_params = if i == 0 { required_count } else { params.len() };
                 // A shorter optional-group variant may not carry every
@@ -745,6 +748,10 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 .as_ref()
                 .map(|s| format!("{}{}", ctx.name_prefix, s.as_str()))
                 .unwrap_or_else(|| format!("{}root", ctx.name_prefix));
+            // A dynamic scope's segments are the root's own:
+            // `scope ":slug" { root … }` is `root_path(slug)` at `/:slug`.
+            let mut params = Vec::new();
+            extract_path_params(&path, &mut params);
             out.push(FlatRoute {
                 method: HttpMethod::Get,
                 source_path: path.clone(),
@@ -752,12 +759,12 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 controller: ClassId(Symbol::from(controller_class)),
                 action: Symbol::from(action_name),
                 as_name: if ctx.helpers_enabled { helper } else { String::new() },
-                path_params: vec![],
-                param_defaults: vec![],
+                required_params: params.len(),
+                param_defaults: defaults_for(ctx, &params),
+                path_params: params,
                 named: ctx.helpers_enabled,
                 helpers_enabled: ctx.helpers_enabled,
                 format: None,
-                required_params: 0,
                 int_params: vec![],
                 constraints: vec![],
                 seg_patterns: vec![],
