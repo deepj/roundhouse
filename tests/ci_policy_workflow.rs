@@ -1,3 +1,5 @@
+#[path = "support/scratch.rs"]
+mod scratch;
 #[cfg(all(target_os = "linux", debug_assertions))]
 #[path = "support/test_subprocess.rs"]
 mod test_subprocess;
@@ -359,8 +361,7 @@ fn strict_emit_ceiling_fails_an_ingest_abort_that_prints_no_error_line() {
         .and_then(|step| step["run"].as_str())
         .expect("strict-emit ceiling")
         .to_owned();
-    let dir = std::env::temp_dir().join(format!("roundhouse-ceiling-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::dir("roundhouse-ceiling");
     let step = |bin_body: &str, ceiling: &str| {
         let bin = dir.join("roundhouse");
         fs::write(&bin, format!("#!/bin/sh\n{bin_body}\n")).unwrap();
@@ -405,11 +406,7 @@ fn test_backtraces_retain_library_and_integration_source_locations() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "roundhouse-backtrace-{}-{unique}",
-        std::process::id()
-    ));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("roundhouse-backtrace-{unique}"));
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -716,11 +713,7 @@ fn rust_identity_ci_guard_requires_execution_and_propagates_failure() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "rust-identity-ci-{}-{unique}",
-        std::process::id()
-    ));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("rust-identity-ci-{unique}"));
     let cargo = root.join("cargo");
     fs::write(
         &cargo,
@@ -857,8 +850,7 @@ fn archive_smoke_reuses_setup_ruby_cache_without_skipping_readme_execution() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("archive-bundle-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("archive-bundle-{unique}"));
     let output = std::process::Command::new("bash")
         .args([
             "-euo",
@@ -927,44 +919,55 @@ fn focused_framework_loop_runs_every_selection_and_preserves_failure() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("framework-loop-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("framework-loop-{unique}"));
+    // `cargo test --no-run` answers each suite's binary; the binary logs how it ran and fails for `fails`.
     let cargo = root.join("cargo");
     fs::write(
         &cargo,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CARGO_LOG\"\n[ \"$3\" != fails ]\n",
+        concat!(
+            "#!/bin/sh\n",
+            "prev=\n",
+            "for a in \"$@\"; do\n",
+            "  if [ \"$prev\" = --test ]; then\n",
+            "    printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\",\"kind\":[\"test\"]},\"executable\":\"%s/%s\"}\\n' \"$a\" \"$STUBS\" \"$a\"\n",
+            "  fi\n",
+            "  prev=$a\n",
+            "done\n",
+        ),
     )
     .unwrap();
     fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let stubs = root.join("stubs");
+    fs::create_dir(&stubs).unwrap();
+    for name in ["first", "second", "fails", "survivor", "param_binds", "param_binds_values", "param_binds_cleanup", "framework_tests_spinel"] {
+        let stub = stubs.join(name);
+        fs::write(&stub, format!("#!/bin/sh\nprintf '{name} %s\\n' \"$*\" >> \"$RUN_LOG\"\n[ {name} != fails ]\n")).unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     for (tests, expected_success, expected_log) in [
-        (
-            "first second",
-            true,
-            "test --test first -- --ignored --nocapture\ntest --test second -- --ignored --nocapture\n",
-        ),
-        (
-            "fails survivor",
-            false,
-            "test --test fails -- --ignored --nocapture\ntest --test survivor -- --ignored --nocapture\n",
-        ),
+        ("first second", true, "first --ignored --nocapture\nsecond --ignored --nocapture\n"),
+        ("fails survivor", false, "fails --ignored --nocapture\nsurvivor --ignored --nocapture\n"),
         (
             "param_binds param_binds_values param_binds_cleanup framework_tests_spinel",
             true,
             concat!(
-                "test --test param_binds -- --ignored --nocapture _spinel\n",
-                "test --test param_binds_values -- --ignored --nocapture _spinel\n",
-                "test --test param_binds_cleanup -- --ignored --nocapture _spinel\n",
-                "test --test framework_tests_spinel -- --ignored --nocapture\n",
+                "framework_tests_spinel --ignored --nocapture\n",
+                "param_binds --ignored --nocapture _spinel\n",
+                "param_binds_cleanup --ignored --nocapture _spinel\n",
+                "param_binds_values --ignored --nocapture _spinel\n",
             ),
         ),
         ("", false, ""),
     ] {
-        let log = root.join("cargo.log");
+        let log = root.join("run.log");
         fs::write(&log, "").unwrap();
         let result = Command::new("bash")
             .args(["-e", "-o", "pipefail", "-c", step["run"].as_str().unwrap()])
             .env("TESTS", tests)
-            .env("CARGO_LOG", &log)
+            .env("RUN_LOG", &log)
+            .env("STUBS", &stubs)
+            .env("RUNNER_TEMP", &root)
+            .env_remove("CI_SPINEL_TIMINGS_OUT")
             .env(
                 "PATH",
                 format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
@@ -972,7 +975,12 @@ fn focused_framework_loop_runs_every_selection_and_preserves_failure() {
             .output()
             .unwrap();
         assert_eq!(result.status.success(), expected_success, "{result:?}");
-        assert_eq!(fs::read_to_string(log).unwrap(), expected_log);
+        // The suites run side by side, so in any order.
+        let mut ran: Vec<String> = fs::read_to_string(log).unwrap().lines().map(String::from).collect();
+        ran.sort();
+        let mut expected: Vec<&str> = expected_log.lines().collect();
+        expected.sort();
+        assert_eq!(ran, expected, "{result:?}");
     }
     fs::remove_dir_all(root).unwrap();
 }
@@ -1251,8 +1259,7 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("full-preflight-{}-{unique}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = scratch::dir(&format!("full-preflight-{unique}"));
     for (name, script) in [(
         "gh",
         "#!/bin/sh\nprintf 'called\\n' >> \"$GH_LOG\"\n[ \"$MOCK_SPINEL\" != unavailable ] || exit 1\nprintf '%s\\n' \"$MOCK_SPINEL\"\n",
@@ -1265,7 +1272,7 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
     for (event, repo, reference, publish, revision, expected) in [
         (
             "schedule",
-            "rubys/roundhouse",
+            "roundhouse-rb/roundhouse",
             "refs/heads/main",
             "false",
             spinel_sha,
@@ -1273,7 +1280,7 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
         ),
         (
             "schedule",
-            "rubys/roundhouse",
+            "roundhouse-rb/roundhouse",
             "refs/heads/main",
             "false",
             "unavailable",
@@ -1281,19 +1288,11 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
         ),
         (
             "schedule",
-            "rubys/roundhouse",
+            "roundhouse-rb/roundhouse",
             "refs/heads/main",
             "false",
             "malformed",
             Some(("true", "master")),
-        ),
-        (
-            "schedule",
-            "roundhouse-rb/roundhouse",
-            "refs/heads/main",
-            "false",
-            spinel_sha,
-            Some(("true", spinel_sha)),
         ),
         (
             "workflow_dispatch",
@@ -1320,16 +1319,24 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
             Some(("false", spinel_sha)),
         ),
         (
+            "schedule",
+            "rubys/roundhouse",
+            "refs/heads/main",
+            "false",
+            spinel_sha,
+            None,
+        ),
+        (
             "workflow_dispatch",
             "rubys/roundhouse",
             "refs/heads/main",
             "true",
             spinel_sha,
-            Some(("true", spinel_sha)),
+            None,
         ),
         (
             "workflow_dispatch",
-            "rubys/roundhouse",
+            "roundhouse-rb/roundhouse",
             "refs/heads/topic",
             "true",
             spinel_sha,
@@ -1373,7 +1380,7 @@ fn scheduler_preflight_executes_publication_guards_and_unknown_input_fallback() 
             .unwrap()
             .lines()
             .count(),
-        7
+        5
     );
     fs::remove_dir_all(root).unwrap();
 }
