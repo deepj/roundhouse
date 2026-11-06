@@ -2829,6 +2829,15 @@ end
     // on a large app the catalog is hundreds of megabytes.
     app.i18n = std::sync::Arc::new(catalog);
     crate::i18n::stamp_models(&mut app);
+    // Now that the locales are known: `show.de.html.erb` is `show`'s text in `de`.
+    // Unset, `available_locales` is every locale I18n's load path names:
+    // the gems' files and Rails' own `en` besides the app's.
+    let implicit = configured.is_none().then(|| {
+        let mut locales = crate::i18n::Catalog::file_locales(&gem_files);
+        locales.push("en".to_string());
+        locales
+    });
+    super::locale_templates::merge(&mut app, implicit.as_deref());
 
     // `sig/**/*.rbs` — user-authored RBS sidecars for app code the
     // Rails conventions can't fully type on their own. Recursively
@@ -8542,6 +8551,9 @@ fn walk_erb<V: Vfs + ?Sized>(
                     // the DSL and shape are identical to the feed formats,
                     // not a different engine concern.
                     || matches!(format, Some("rss" | "atom" | "xml" | "xls"))
+                    // `show.de.erb`: a locale and no format, which
+                    // `locale_templates` reads as Rails does.
+                    || format.is_some_and(super::locale_templates::lone_locale)
                 {
                     out.push((path, engine));
                 } else {
