@@ -327,6 +327,176 @@ fn rails_makes_its_own_en_available() {
     );
 }
 
+const ZH_HANS: &str = "    config.i18n.available_locales = [:en, :de, :\"zh-Hans\"]\n    config.i18n.default_locale = :en\n";
+
+/// The table's app under `config` (`config/application.rb`'s I18n
+/// lines) with `greeting`, whose templates name no format:
+/// `greeting.zh-Hans.erb` is in a locale only `available_locales` can
+/// name, not shaped like `xx` or `xx-YY`.
+fn greeting_files(config: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = files(false)
+        .into_iter()
+        .map(|(path, body)| {
+            let body = match path.as_str() {
+                "config/application.rb" => config_rb(config),
+                "config/routes.rb" => body.replacen("end\n", "  get \"greeting\", to: \"pages#greeting\"\nend\n", 1),
+                "app/controllers/pages_controller.rb" => body.replacen("  def faq\n", "  def greeting\n  end\n\n  def faq\n", 1),
+                _ => body,
+            };
+            (path, body)
+        })
+        .collect();
+    out.push(("app/views/pages/greeting.erb".into(), "<p>Hello</p>\n".into()));
+    out.push(("app/views/pages/greeting.zh-Hans.erb".into(), "<p>Nihao</p>\n".into()));
+    out
+}
+
+/// `greeting.zh-Hans.erb` is `greeting` in `zh-Hans` once
+/// `available_locales` names it, as Rails reads it
+/// (`rails_reads_a_lone_segment_available_locales_names`).
+#[test]
+fn a_lone_segment_available_locales_names_is_a_locale() {
+    greeting_files(ZH_HANS)
+        .into_iter()
+        .fold(emit_and_run::empty_app(), |app, (path, body)| app.write(&path, &body))
+        .run_ruby(&format!(
+            "require \"stringio\"\ndef req(env)\n  status, _headers, body = Main.run_rack({RACK_ENV})\n  text = +\"\"\n  body.each {{ |part| text << part }}\n  status == 200 ? text.gsub(/\\s*\\n\\s*/, \"\") : \"!#{{status}}\"\nend\n\
+             got = [req([\"greeting\", \"locale=en\"]), req([\"greeting\", \"locale=zh-Hans\"]), req([\"greeting\", \"locale=de\"])]\n\
+             want = [\"[en]<p>Hello</p>\", \"[en]<p>Nihao</p>\", \"[de]<p>Hello</p>\"]\n\
+             raise got.inspect unless got == want\nputs \"PASS\"\n"
+        ))
+        .assert_passes();
+}
+
+/// A lone segment no available locale names, and not shaped like one,
+/// is no locale: its template is skipped as any format the walker does
+/// not take is, an error in strict ingest and a gap in a survey, and
+/// leaves no view.
+#[test]
+fn a_lone_segment_no_available_locale_names_is_skipped() {
+    use roundhouse::ingest::{IngestError, ingest_app_from_tree, survey};
+    let tree = |config: &str, extra: &[(&str, &str)]| -> std::collections::HashMap<std::path::PathBuf, Vec<u8>> {
+        greeting_files(config)
+            .into_iter()
+            .map(|(p, s)| (p.into(), s.into_bytes()))
+            .chain(extra.iter().map(|(p, s)| (p.into(), s.as_bytes().to_vec())))
+            .collect()
+    };
+    let unavailable = "    config.i18n.available_locales = [:en, :de]\n    config.i18n.default_locale = :en\n";
+    for (config, extra, file) in [
+        (unavailable, &[][..], "greeting.zh-Hans.erb"),
+        (ZH_HANS, &[("app/views/pages/greeting.foo.erb", "<p>Foo</p>\n")][..], "greeting.foo.erb"),
+    ] {
+        let err = ingest_app_from_tree(tree(config, extra)).expect_err("strict ingest refuses the template");
+        assert!(
+            matches!(&err, IngestError::Unsupported { file: f, message }
+                if f.ends_with(file) && message == "view template not ingested: erb (non-html format)"),
+            "{err}"
+        );
+        survey::activate();
+        let result = ingest_app_from_tree(tree(config, extra));
+        let gaps = survey::drain();
+        let app = result.expect("survey ingest recovers");
+        assert!(
+            gaps.iter().any(|g| matches!(g, IngestError::Unsupported { file: f, message }
+                if f.ends_with(file) && message == "view template not ingested: erb (non-html format)")),
+            "{gaps:?}"
+        );
+        let greeting: Vec<String> = app
+            .views
+            .iter()
+            .filter(|v| v.name.as_str().starts_with("pages/greeting"))
+            .map(|v| format!("{} {}", v.name.as_str(), v.format.as_str()))
+            .collect();
+        assert_eq!(greeting, ["pages/greeting html"]);
+    }
+}
+
+/// A path gem whose locale file names `de-CH` and `fr`.
+fn with_widgets_gem(app: emit_and_run::Overlay) -> emit_and_run::Overlay {
+    app.write("Gemfile", "source \"https://rubygems.org\"\ngem \"rails\"\ngem \"widgets\", path: \"engines/widgets\"\n")
+        .write("Gemfile.lock", "PATH\n  remote: engines/widgets\n  specs:\n    widgets (0.1.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\nDEPENDENCIES\n  widgets!\n")
+        .write("engines/widgets/widgets.gemspec", "Gem::Specification.new do |s|\n  s.name = \"widgets\"\n  s.version = \"0.1.0\"\n  s.summary = \"widgets\"\n  s.authors = [\"widgets\"]\n  s.files = Dir[\"lib/**/*\", \"config/**/*\"]\nend\n")
+        .write("engines/widgets/lib/widgets.rb", "require \"widgets/engine\"\n\nmodule Widgets\nend\n")
+        .write("engines/widgets/lib/widgets/engine.rb", "require \"rails\"\n\nmodule Widgets\n  class Engine < Rails::Engine\n  end\nend\n")
+        .write("engines/widgets/config/locales/widgets.yml", "de-CH:\n  widgets: \"Widgets\"\nfr:\n  widgets: \"Gadgets\"\n")
+}
+
+/// With `available_locales` unset, a gem's locale file makes `de-CH`
+/// available, and Rails renders `welcome.de` for it, its parent's
+/// template (`rails_renders_a_gem_locales_parent_template`). This
+/// build's locales are the app's files', so `de-CH` gets its own arm;
+/// `fr`, which finds the default locale's template, does not.
+#[test]
+fn a_locale_only_a_gem_makes_available_finds_its_parents_template() {
+    let app = with_widgets_gem(app(false).write("config/application.rb", &config_rb("    config.i18n.default_locale = :en\n")));
+    let (emitted, errors) = app.emit(BuildTarget::Spinel);
+    assert!(!errors.iter().any(|e| e.contains("locale_template")), "{errors:#?}");
+    let welcome = std::fs::read_to_string(emitted.join("app/views/pages/welcome.rb")).expect("welcome.rb");
+    let arm = welcome.split_once("when \"de-CH\"").map_or("", |(_, rest)| rest);
+    let arm = &arm[..["when ", "else"].iter().filter_map(|m| arm.find(m)).min().unwrap_or(arm.len())];
+    assert!(arm.contains("Willkommen") && !arm.contains("Welcome"), "{welcome}");
+    assert!(!welcome.contains("\"fr\""), "{welcome}");
+}
+
+/// `greeting.zh-Hans.erb`, against Rails 8.1.4.
+#[test]
+fn rails_reads_a_lone_segment_available_locales_names() {
+    let probe = r#"gem "railties", "8.1.4"; gem "activerecord", "8.1.4"; gem "actionmailer", "8.1.4"; require "rails"; require "sqlite3""#;
+    if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
+        eprintln!("skipping: ruby with railties 8.1.4, actionmailer and sqlite3 not available");
+        return;
+    }
+    let root = scratch::dir("roundhouse-locale-templates-lone");
+    for (path, body) in greeting_files(ZH_HANS) {
+        let p = root.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    let asserts = "def req(q)\n  status, _h, body = RefApp.call(Rack::MockRequest.env_for(\"/greeting?\" + q))\n  text = +\"\"\n  body.each { |part| text << part }\n  [status, text.gsub(/\\s*\\n\\s*/, \"\")]\nend\n\
+        got = [req(\"locale=en\"), req(\"locale=zh-Hans\"), req(\"locale=de\")]\n\
+        want = [[200, \"[en]<p>Hello</p>\"], [200, \"[en]<p>Nihao</p>\"], [200, \"[de]<p>Hello</p>\"]]\n\
+        raise got.inspect unless got == want\n";
+    let output = rails(&root, ZH_HANS, asserts);
+    let _ = std::fs::remove_dir_all(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("Rails agrees"),
+        "=== stdout ===\n{stdout}\n=== stderr ===\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A locale only a locale file outside the app's makes available
+/// (`de-CH`), against Rails 8.1.4: it renders `welcome.de`.
+#[test]
+fn rails_renders_a_gem_locales_parent_template() {
+    let probe = r#"gem "railties", "8.1.4"; gem "activerecord", "8.1.4"; gem "actionmailer", "8.1.4"; require "rails"; require "sqlite3""#;
+    if !Command::new("ruby").args(["-e", probe]).status().is_ok_and(|s| s.success()) {
+        eprintln!("skipping: ruby with railties 8.1.4, actionmailer and sqlite3 not available");
+        return;
+    }
+    let root = scratch::dir("roundhouse-locale-templates-gem");
+    for (path, body) in files(false).into_iter().chain([("widgets/widgets.yml".to_string(), "de-CH:\n  widgets: \"Widgets\"\nfr:\n  widgets: \"Gadgets\"\n".to_string())]) {
+        let p = root.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    let asserts = "def req(q)\n  status, _h, body = RefApp.call(Rack::MockRequest.env_for(\"/welcome?\" + q))\n  text = +\"\"\n  body.each { |part| text << part }\n  [status, text.gsub(/\\s*\\n\\s*/, \"\")]\nend\n\
+        got = [req(\"locale=de-CH\"), req(\"locale=fr\"), I18n.available_locales.sort]\n\
+        want = [[200, \"[de]<h1>Willkommen readers</h1>\"], [200, \"[en]<h1>Welcome readers</h1>\"], [:de, :\"de-CH\", :en, :fr]]\n\
+        raise got.inspect unless got == want\n";
+    let config = "    config.i18n.default_locale = :en\n    config.i18n.load_path << File.join(config.root, \"widgets/widgets.yml\")\n";
+    let output = rails(&root, config, asserts);
+    let _ = std::fs::remove_dir_all(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("Rails agrees"),
+        "=== stdout ===\n{stdout}\n=== stderr ===\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// The table, against Rails 8.1.4.
 #[test]
 fn rails_answers_the_table() {

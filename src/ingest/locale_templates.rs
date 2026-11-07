@@ -25,16 +25,18 @@
 //! lookup above finds — decided now, from the app's I18n settings, so
 //! every render site, the signature (the variants' ivars and locals
 //! together) and every target see one ordinary template. When one
-//! template answers every locale there is no `case` at all.
+//! template answers every locale there is no `case` at all. A locale
+//! Rails makes available that this build's locales lack (`de-CH` from a
+//! gem) gets an arm too when the template it finds is not the default's.
 //!
 //! What is not modeled is an error, and the variants keep their stems:
 //! a locale no template answers (Rails' missing template), a Jbuilder
 //! template, variants in different view paths, different strict-locals
 //! headers, I18n settings the choice depends on but ingest cannot read,
-//! and a template for a locale Rails makes available that this build's
-//! locales lack (an unset `available_locales` takes gems' and Rails' own
-//! locale files too). A template for a locale Rails never makes
-//! available is never picked, there as here. (A request variant,
+//! and a template named for a locale Rails makes available that this
+//! build's locales lack (an unset `available_locales` takes gems' and
+//! Rails' own locale files too). A template for a locale Rails never
+//! makes available is never picked, there as here. (A request variant,
 //! `show.html+phone.erb`, is not ingested at all.)
 
 use crate::app::App;
@@ -127,7 +129,7 @@ pub(super) fn merge(app: &mut App, implicit: Option<&[String]>) {
 fn split(view: &View, available: &[String]) -> (String, Option<String>, String, Option<bool>) {
     let name = view.name.as_str();
     let format = view.format.as_str();
-    let is_locale = |s: &str| available.iter().any(|l| l == s) || locale_shaped(s);
+    let is_locale = |s: &str| names_locale(s, available);
     if is_locale(format) && !FORMATS.contains(&format) {
         return (name.to_string(), Some(format.to_string()), "html".to_string(), Some(false));
     }
@@ -142,11 +144,19 @@ fn split(view: &View, available: &[String]) -> (String, Option<String>, String, 
     (name.to_string(), None, format.to_string(), None)
 }
 
-/// A lone segment before the handler that is a locale, not a format
-/// (`show.de.erb`), as far as the shape tells before the app's locales
-/// are read.
-pub(super) fn lone_locale(segment: &str) -> bool {
-    locale_shaped(segment) && !FORMATS.contains(&segment)
+/// A lone segment before the handler that is no format and may be a
+/// locale (`show.de.erb`, `show.zh-Hans.erb`): letters, digits, `-` and
+/// `_`. Which it is waits for the app's locales ([`names_locale`]).
+pub(super) fn lone_segment(segment: &str) -> bool {
+    !FORMATS.contains(&segment)
+        && segment.starts_with(|c: char| c.is_ascii_alphabetic())
+        && segment.split(['-', '_']).all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// Whether `PathParser` reads `segment` as a locale: an available one,
+/// or one shaped like a locale.
+pub(super) fn names_locale(segment: &str, available: &[String]) -> bool {
+    available.iter().any(|l| l == segment) || locale_shaped(segment)
 }
 
 /// `[a-z]{2}(?:[-_][A-Z]{2})?`, the shape `PathParser` takes for a
@@ -211,9 +221,12 @@ fn choose(app: &App, members: &[Member], implicit: Option<&[String]>) -> Result<
         return Err("its templates are in different view paths, where Rails takes the first path with any match".into());
     }
 
-    // Per locale, the member its lookup finds, the same in every environment.
+    // Per locale, the member its lookup finds, the same in every
+    // environment. A locale Rails makes available that this build's
+    // locales lack (`de-CH` from a gem) finds its parent's template.
+    let extra = implicit.unwrap_or_default().iter().filter(|l| !locales.contains(l));
     let mut chosen: Vec<(String, usize)> = Vec::new();
-    for locale in &locales {
+    for locale in locales.iter().chain(extra) {
         let mut pick: Option<Option<usize>> = None;
         for variant in catalog.variants(std::slice::from_ref(locale)) {
             let mut chain = crate::i18n::fallback_chain(locale, variant.fallbacks.as_deref().unwrap_or_default());
@@ -320,7 +333,7 @@ fn handler_refusal(view: &View) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::locale_shaped;
+    use super::{locale_shaped, lone_segment};
 
     #[test]
     fn locale_shape_is_path_parsers() {
@@ -329,6 +342,16 @@ mod tests {
         }
         for no in ["html", "DE", "d", "deu", "pt-br", "sr-Latn", "en-"] {
             assert!(!locale_shaped(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_lone_segment_may_be_any_locale_but_no_format() {
+        for yes in ["de", "zh-Hans", "es-419", "sr_Latn", "foo"] {
+            assert!(lone_segment(yes), "{yes}");
+        }
+        for no in ["html", "js", "turbo_stream", "en-", "-en", "de--AT", "1x", "de.AT", "de+phone", ""] {
+            assert!(!lone_segment(no), "{no}");
         }
     }
 }
