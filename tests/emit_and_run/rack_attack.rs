@@ -2,6 +2,8 @@
 //! settings run at boot, and its Railtie's `app.middleware.use(Rack::Attack)`
 //! puts it on the stack where Rails does, inside RequestId and before the routes.
 
+#[path = "../support/prerequisite.rs"]
+mod prerequisite;
 use roundhouse::build_target::BuildTarget;
 
 use super::emit_and_run;
@@ -115,7 +117,7 @@ fn the_spinel_tree_stacks_the_railtie_middleware() {
     let (tree, errors) = app().emit(BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
     let stack = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb")).expect("gem_middleware.rb");
-    assert!(stack.contains("Rack::Attack.new(app).call(GemMiddleware.env_of(req, request_obj))"), "{stack}");
+    assert!(stack.contains("@stack ||= Rack::Attack.new(App.new)"), "{stack}");
     let attack = std::fs::read_to_string(tree.join("app/models/rack/attack.rb")).expect("the compiled gem");
     // Each nested class under its own namespace.
     assert!(attack.contains("class Configuration\n"), "{attack}");
@@ -127,7 +129,7 @@ fn the_spinel_tree_stacks_the_railtie_middleware() {
 fn the_spinel_rack_request_port_finds_the_client_rack_finds() {
     let rack = std::process::Command::new("ruby").args(["-rrack", "-e", "1"]).status();
     if !rack.is_ok_and(|s| s.success()) {
-        eprintln!("skipping: ruby with the rack gem not available");
+        prerequisite::missing("ruby with the rack gem not available");
         return;
     }
     let envs = r#"[
@@ -159,15 +161,19 @@ fn the_spinel_adapter_sends_the_response_the_middleware_returns() {
     assert!(errors.is_empty(), "{errors:#?}");
     let adapter = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb"))
         .expect("gem_middleware.rb")
-        .replace("Rack::Attack.new(app)", "Probe.new(app)");
+        .replace("Rack::Attack.new(App.new)", "Probe.new(App.new)");
     let script = format!(
         r#"{adapter}
 module Tep
   def self.str_hash = {{}}
 end
+module ActionDispatch
+  class Session
+  end
+end
 Res = Struct.new(:status, :headers, :body, :file_path, :streaming, :set_cookies, :header_fields)
 Req = Struct.new(:verb, :path, :raw_query, :remote_host, :http_version, :req_headers, :raw_body)
-ReqObj = Struct.new(:request_id)
+ReqObj = Struct.new(:request_id, :env, :session)
 module Main
   def self.dispatch_request(req, res, _obj)
     res.status = 200
@@ -178,7 +184,16 @@ module Main
   end
 end
 class Probe
-  def initialize(app) = @app = app
+  class << self
+    attr_accessor :built
+  end
+  self.built = 0
+  def initialize(app)
+    Probe.built += 1
+    # Wide enough for a second first request to arrive while this one builds.
+    sleep 0.05
+    @app = app
+  end
   def call(env)
     env["PATH_INFO"] = env["PATH_INFO"].sub("/old", "/new")
     status, headers, body = response = @app.call(env)
@@ -191,9 +206,11 @@ class Probe
 end
 def run(path)
   res = Res.new(0, {{}}, +"", +"", false, [], [])
-  GemMiddleware.dispatch(Req.new("GET", path, "", "127.0.0.1", "HTTP/1.1", {{}}, ""), res, ReqObj.new("id"))
+  GemMiddleware.dispatch(Req.new("GET", path, "", "127.0.0.1", "HTTP/1.1", {{}}, ""), res, ReqObj.new("id", {{}}, {{}}))
   res
 end
+# Two first requests at once still build one stack.
+2.times.map {{ Thread.new {{ run("/old/first") }} }}.each(&:join)
 res = run("/file")
 raise "file: #{{res.to_h}}" unless res.status == 429 && res.body == "replaced" && res.file_path == "" && res.headers == {{ "x-own" => "1" }}
 res = run("/stream")
@@ -202,6 +219,8 @@ res = run("/element")
 raise "element: #{{res.to_h}}" unless res.body == "element" && res.headers["x-routes"] == "/element"
 res = run("/old/page")
 raise "path: #{{res.to_h}}" unless res.body == "routes body" && res.headers["x-routes"] == "/new/page"
+# Built once, as Rails builds its stack, not per request.
+raise "built #{{Probe.built}} times" unless Probe.built == 1
 puts "adapter passed"
 "#
     );

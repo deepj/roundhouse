@@ -18,6 +18,7 @@
 //! broadcasts orchestration, schema → DDL, and router dispatch tables.
 
 pub mod arel;
+pub mod route_guards;
 pub mod array_columns;
 pub mod associations;
 pub mod association_new;
@@ -266,6 +267,7 @@ pub use in_predicate::apply_in_predicate_lowering;
 pub use including::apply_including_lowering;
 pub use relation_select_block::apply_relation_select_block_lowering;
 pub use enum_symbols::apply_enum_symbol_lowering;
+pub(crate) use enum_symbols::WRITER_METHODS as ENUM_WRITER_METHODS;
 pub use has_json::apply_has_json_lowering;
 pub use route_format_suffix::apply_route_format_suffix_lowering;
 pub use route_url_options::apply_route_url_options_lowering;
@@ -1054,7 +1056,7 @@ pub(crate) fn apply_post_analyze_lowerings_for(
     ran!("authenticate_by");
     // After authenticate_by: its expansion is a `find_by` whose keyword
     // a `normalizes` declaration applies to.
-    normalizes::apply_normalizes_finder_lowering(app);
+    normalizes::apply_normalizes_finder_lowering(app, target);
     ran!("normalizes");
     dead_default::apply_dead_default_lowering(app, registry);
     ran!("dead_default");
@@ -1270,6 +1272,17 @@ pub(crate) fn for_each_test_body(
     }
 }
 
+macro_rules! action_defaults {
+    ($action:ident, $f:ident, $iter:ident, $option:ident) => {
+        for (_, default) in $action.opt_params.$iter() {
+            $f(default);
+        }
+        for default in $action.kw_params.$iter().filter_map(|(_, e)| e.$option()) {
+            $f(default);
+        }
+    };
+}
+
 pub(crate) fn for_each_hook_body(
     app: &mut crate::app::App,
     f: &mut impl FnMut(&mut crate::expr::Expr),
@@ -1400,9 +1413,7 @@ pub(crate) fn for_each_owned_hook_body(
         for item in body {
             match item {
                 crate::dialect::ControllerBodyItem::Action { action, .. } => {
-                    for (_name, default) in &mut action.opt_params {
-                        f(default);
-                    }
+                    action_defaults!(action, f, iter_mut, as_mut);
                     f(&mut action.body)
                 }
                 crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => {
@@ -1452,6 +1463,15 @@ pub(crate) fn for_each_hook_body_ref(
     app: &crate::app::App,
     f: &mut impl FnMut(&crate::expr::Expr),
 ) {
+    for_each_owned_hook_body_ref(app, &mut |_, body| f(body))
+}
+
+/// [`for_each_hook_body_ref`] with each body's owner, as
+/// [`for_each_owned_hook_body`] gives it.
+pub(crate) fn for_each_owned_hook_body_ref(
+    app: &crate::app::App,
+    f: &mut impl FnMut(Option<&crate::ident::ClassId>, &crate::expr::Expr),
+) {
     fn visit_param_defaults(
         params: &[crate::dialect::Param],
         f: &mut impl FnMut(&crate::expr::Expr),
@@ -1463,6 +1483,7 @@ pub(crate) fn for_each_hook_body_ref(
         }
     }
     for model in &app.models {
+        let f = &mut |e: &crate::expr::Expr| f(Some(&model.name), e);
         for item in &model.body {
             match item {
                 crate::dialect::ModelBodyItem::Method { method, .. } => {
@@ -1504,6 +1525,7 @@ pub(crate) fn for_each_hook_body_ref(
         }
     }
     for lc in &app.library_classes {
+        let f = &mut |e: &crate::expr::Expr| f(Some(&lc.name), e);
         for method in &lc.methods {
             visit_param_defaults(&method.params, f);
             f(&method.body);
@@ -1520,6 +1542,7 @@ pub(crate) fn for_each_hook_body_ref(
     }
     // Same set as the mutable twin — see the note there.
     if let Some(lc) = &app.rails_application {
+        let f = &mut |e: &crate::expr::Expr| f(Some(&lc.name), e);
         for method in &lc.methods {
             visit_param_defaults(&method.params, f);
             f(&method.body);
@@ -1535,12 +1558,11 @@ pub(crate) fn for_each_hook_body_ref(
         }
     }
     for controller in &app.controllers {
+        let f = &mut |e: &crate::expr::Expr| f(Some(&controller.name), e);
         for item in &controller.body {
             match item {
                 crate::dialect::ControllerBodyItem::Action { action, .. } => {
-                    for (_name, default) in &action.opt_params {
-                        f(default);
-                    }
+                    action_defaults!(action, f, iter, as_ref);
                     f(&action.body)
                 }
                 crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => {
@@ -1561,10 +1583,10 @@ pub(crate) fn for_each_hook_body_ref(
         }
     }
     if let Some(seeds) = &app.seeds {
-        f(seeds);
+        f(None, seeds);
     }
     for stmt in &app.boot_program {
-        f(stmt);
+        f(None, stmt);
     }
 }
 
@@ -1616,15 +1638,6 @@ pub(crate) fn for_each_emit_body(app: &mut crate::App, f: &mut impl FnMut(&mut c
                     | crate::dialect::Association::HasMany { scope: Some(e), .. }
                     | crate::dialect::Association::HasOne { scope: Some(e), .. } => f(e),
                     _ => {}
-                }
-            }
-        }
-    }
-    for controller in &mut app.controllers {
-        for item in &mut controller.body {
-            if let crate::dialect::ControllerBodyItem::Action { action, .. } = item {
-                for default in action.kw_params.iter_mut().filter_map(|(_, e)| e.as_mut()) {
-                    f(default);
                 }
             }
         }
@@ -1683,9 +1696,6 @@ pub(crate) fn for_each_emit_body_ref(app: &crate::App, f: &mut impl FnMut(&crate
             | crate::dialect::Association::HasOne { scope: Some(e), .. } => f(e),
             _ => {}
         }
-    }
-    for action in app.controllers.iter().flat_map(|c| c.actions()) {
-        for default in action.kw_params.iter().filter_map(|(_, e)| e.as_ref()) { f(default); }
     }
     for view in &app.views {
         for default in view.strict_locals.iter().flatten().filter_map(|p| p.default.as_ref()) { f(default); }
@@ -1880,7 +1890,7 @@ mod body_root_tests {
     fn surveys_and_rewrites_visit_each_owned_root_once_in_order() {
         let files = [
             ("app/models/widget.rb", "class Widget < ApplicationRecord\n def probe(value=11); 12; end\n scope :slice, ->(value=13) { 14 }\n before_save :probe, if: -> { 15 }\n has_many :items do\n def extra(value=16); 17; end\n end\n dsl(18)\nend"),
-            ("app/controllers/widgets_controller.rb", "class WidgetsController < ApplicationController\n before_action :probe, if: -> { 19 }, unless: -> { 20 }\n def index(value=21); 22; end\n dsl(23)\nend"),
+            ("app/controllers/widgets_controller.rb", "class WidgetsController < ApplicationController\n before_action :probe, if: -> { 19 }, unless: -> { 20 }\n def index(value=21, keyword: 44, required:); 22; end\n dsl(23)\nend"),
             ("app/services/probe.rb", "class Probe\n ITEM=24\n dsl(25)\n def probe(value=26); 27; end\nend\nclass Counter\n @@counter=nil\n def probe(value=28); 29; end\nend"),
             ("config/application.rb", "module Shell\n class Application < Rails::Application\n def probe(value=30); 31; end\n end\nend"),
             ("db/seeds.rb", "34"),
@@ -1899,7 +1909,7 @@ mod body_root_tests {
             ExprNode::Lit { value: Literal::Int { value: 33 } }));
         let hooks = ["11", "12", "13", "14", "15", "16", "17", "18",
             "26", "27", "24", "25", "28", "29", "@@counter",
-            "30", "31", "32", "33", "19", "20", "21", "22", "23", "34"];
+            "30", "31", "32", "33", "19", "20", "21", "44", "22", "23", "34"];
         let extras = ["35", "40", "36", "37", "41", "39", "38", "43", "42", "@@nested"];
         let mut seen = Vec::new();
         for_each_hook_body_ref(&app, &mut |root| trace(root, &mut seen));
@@ -1916,6 +1926,9 @@ mod body_root_tests {
         let expected: Vec<_> = hooks.into_iter().chain(extras).collect();
         seen.clear();
         for_each_emit_body_ref(&app, &mut |root| trace(root, &mut seen));
+        assert_eq!(seen, expected);
+        seen.clear();
+        for_each_emit_body(&mut app, &mut |root| trace(root, &mut seen));
         assert_eq!(seen, expected);
         seen.clear();
         for_each_forwarding_body(&mut app, &mut |root| {

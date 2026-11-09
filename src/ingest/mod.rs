@@ -59,6 +59,7 @@ pub(crate) mod database_ownership;
 pub(crate) mod database_yml;
 pub mod sidekiq_yml;
 pub mod cable_yml;
+pub(crate) mod config_for;
 mod public_file_server_config;
 mod action_controller_caching_config;
 mod json_response_config;
@@ -88,7 +89,6 @@ pub mod expr;
 pub mod fixture;
 pub(crate) mod forwarding;
 pub(crate) mod controller_macro_synth;
-pub(crate) mod devise_routes;
 pub mod impersonates;
 pub mod invisible_captcha;
 pub mod generated_helpers;
@@ -115,6 +115,9 @@ mod external_include;
 mod hook_class_attribute;
 pub(crate) mod inherited_alias;
 mod class_macros;
+mod configured_superclass;
+mod gem_hooks;
+mod gem_routes;
 mod column_accessors;
 mod model_macros;
 mod referenced_carriers;
@@ -216,3 +219,23 @@ impl From<std::io::Error> for IngestError {
 }
 
 type IngestResult<T> = Result<T, IngestError>;
+
+/// An empty reopen of `Rails::Application`, which ingest fills with the
+/// methods it lifts from the app's config.
+pub(crate) fn rails_application_class() -> crate::dialect::LibraryClass {
+    crate::dialect::LibraryClass {
+        name: crate::ident::ClassId(crate::ident::Symbol::from("Rails::Application")),
+        is_module: false,
+        parent: None,
+        parent_span: Default::default(),
+        includes: Vec::new(),
+        include_spans: Vec::new(),
+        methods: Vec::new(),
+        nullable_columns: Vec::new(),
+        origin: None,
+        constants: Vec::new(),
+        conditional_definitions: Vec::new(),
+        unknown_calls: Vec::new(),
+        class_ivar_initializers: Vec::new(),
+    }
+}

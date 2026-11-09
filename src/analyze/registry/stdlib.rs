@@ -714,6 +714,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "ActiveSupport::ConfigurationFile", &[
         ("parse", Ty::Untyped),
     ], &[]);
+    // `config_for`'s Hash: Rails' own class, in the ruby family's overlay
+    // (`ruby_overlay/runtime/active_support_ordered_options.rb`).
+    let ordered_options = Ty::Class { id: ClassId(Symbol::from("ActiveSupport::OrderedOptions")), args: vec![].into() };
+    register_stdlib_class(classes, "ActiveSupport::OrderedOptions", &[
+        ("new", ordered_options.clone()),
+    ], &[
+        ("update", ordered_options),
+    ]);
     {
         let continuable = classes.entry(ClassId(Symbol::from("ActiveJob::Continuable"))).or_default();
         continuable.is_module = true;
@@ -775,9 +783,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("time_fragment", Ty::Str),
         ("written", Ty::Str),
     ], &[]);
-    // `Rack::Utils` — the two encoding-negotiation functions, ported
-    // into `runtime/ruby/rack_utils.rb` (the rack gem's own on the ruby
-    // family). ONLY that surface, the IPAddr rule. A pair is
+    // `Rack::Utils` — the two encoding-negotiation functions and
+    // `unescape_path`, ported into `runtime/ruby/rack_utils.rb` (the rack
+    // gem's own on the ruby family). ONLY that surface, the IPAddr rule. A pair is
     // `[name, quality]`; the name is nil for an empty header part.
     let q_pair = Ty::Tuple {
         elems: vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }, Ty::Float].into(),
@@ -785,6 +793,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "Rack::Utils", &[
         ("q_values", Ty::Array { elem: std::sync::Arc::new(q_pair) }),
         ("select_best_encoding", Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }),
+        ("unescape_path", Ty::Str),
     ], &[]);
     // `Rack::Utils::HTTP_STATUS_CODES` — the status-code-to-reason-phrase
     // table every app can reach for (`Rack::Utils::HTTP_STATUS_CODES
@@ -964,10 +973,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         "LoadError",
         // lobsters' `Sponge::OTHER_PEOPLES_PROBLEMS`, a class-body Array
         // of exception classes. zlib's and Encoding's are Ruby's own and
-        // spinel's (`packages/zlib`, `lib/sp_exc.c`). net/protocol's
-        // `HTTPBadResponse` is CRuby's only: spinel's `packages/net`
-        // does not define it, so `project::unavailable_class_module_construct`
-        // ledgers it there.
+        // spinel's (`packages/zlib`, `lib/sp_exc.c`, `packages/net`).
         "Zlib::DataError", "Encoding::CompatibilityError", "Net::HTTPBadResponse",
         // `rescue EncodingError` around a zone file's text (tzinfo's ZoneinfoDataSource).
         "EncodingError",
@@ -998,10 +1004,26 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("Psych::BadAlias", "Psych::Exception"),
         ("Psych::AliasesNotEnabled", "Psych::BadAlias"),
         ("Psych::AnchorNotDefined", "Psych::BadAlias"),
+        // `rescue WeakRef::RefError` around a read of a collected referent.
+        ("WeakRef::RefError", "StandardError"),
     ] {
         register_stdlib_class(classes, exc, &[], &exception_surface);
         classes.entry(ClassId(Symbol::from(exc))).or_default().parent =
             Some(ClassId(Symbol::from(parent)));
+    }
+    // ECError aliases PKeyError; source may reopen either spelling with different returns.
+    let gradual_errors: Vec<_> = exception_surface.iter().map(|(name, _)| (*name, Ty::Untyped)).collect();
+    for (exc, parent) in [
+        ("OpenSSL::PKey::PKeyError", "OpenSSL::OpenSSLError"),
+        ("OpenSSL::PKey::ECError", "OpenSSL::PKey::PKeyError"),
+        ("OpenSSL::Digest::DigestError", "OpenSSL::OpenSSLError"),
+        ("OpenSSL::KDF::KDFError", "OpenSSL::OpenSSLError"),
+        ("OpenSSL::Cipher::CipherError", "OpenSSL::OpenSSLError"),
+        ("OpenSSL::Cipher::AuthTagError", "OpenSSL::Cipher::CipherError"),
+    ] {
+        let surface = if matches!(exc, "OpenSSL::PKey::PKeyError" | "OpenSSL::PKey::ECError") { gradual_errors.as_slice() } else { &[] };
+        register_stdlib_class(classes, exc, &[], surface);
+        classes.entry(ClassId(Symbol::from(exc))).or_default().parent = Some(ClassId(Symbol::from(parent)));
     }
     // Exception owners preserve their runtime ancestry, without claiming a
     // constructor implementation. The body typer refuses that missing API.
@@ -1192,12 +1214,22 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             ("method", Ty::Str), ("path", Ty::Str),
         ]);
     }
-    // `Net::ProtocolError` — Spinel's packages/net defines it (with
-    // OpenTimeout / ReadTimeout). `Net::HTTPBadResponse` is registered
-    // above for Lobsters and Spinel-ledgers via
-    // `unavailable_class_module_construct`. `Net::HTTPHeaderSyntaxError`
-    // stays a CRuby-only constant gap until Spinel grows it (invariant 6).
+    // HTTP exceptions and their protocol bases are native class values.
     register_stdlib_class(classes, "Net::ProtocolError", &[], &exception_surface);
+    for (exc, parent) in [
+        ("Net::WriteTimeout", "Timeout::Error"),
+        ("Net::HTTPHeaderSyntaxError", "StandardError"),
+        ("Net::HTTPError", "Net::ProtocolError"),
+        ("Net::HTTPRetriableError", "Net::ProtoRetriableError"),
+        ("Net::HTTPClientException", "Net::ProtoServerError"),
+        ("Net::HTTPFatalError", "Net::ProtoFatalError"),
+        ("Net::ProtoFatalError", "Net::ProtocolError"),
+        ("Net::ProtoServerError", "Net::ProtocolError"),
+        ("Net::ProtoRetriableError", "Net::ProtocolError"),
+    ] {
+        register_stdlib_class(classes, exc, &[], &[]);
+        classes.entry(ClassId(Symbol::from(exc))).or_default().parent = Some(ClassId(Symbol::from(parent)));
+    }
     // `Mime::Type` — the class `runtime/ruby/mime.rb` ports from
     // actionpack. `lookup` is deliberately NON-nilable: upstream answers
     // a Type for any well-formed string (symbol nil when unregistered)
@@ -1215,8 +1247,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("symbol", Ty::Union { variants: vec![Ty::Sym, Ty::Nil].into() }),
         ("to_sym", Ty::Union { variants: vec![Ty::Sym, Ty::Nil].into() }),
         ("to_s", Ty::Str), ("to_str", Ty::Str), ("inspect", Ty::Str),
+        ("ref", Ty::Union { variants: vec![Ty::Sym, Ty::Str].into() }),
         ("hash", Ty::Int), ("==", Ty::Bool), ("eql?", Ty::Bool),
     ]);
+    // `html?`, `json?`, …: one predicate per registered symbol, as `runtime/ruby/mime.rb` spells them out.
+    for format in MIME_PREDICATES {
+        classes.entry(ClassId(Symbol::from("Mime::Type"))).or_default().instance_methods.insert(Symbol::from(format!("{format}?")), Ty::Bool);
+    }
     // `URI.parse` can return scheme-specific classes beyond HTTP/HTTPS;
     // keep it gradual while class guards recover the readers below.
     register_stdlib_class(classes, "URI", &[
@@ -1245,7 +1282,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     }
     // `res.is_a?(Net::HTTPSuccess)` — lobsters' Github; spinel's
     // `packages/net` defines the same response family.
-    for response in ["Net::HTTPRedirection", "Net::HTTPOK", "Net::HTTPSuccess"] {
+    for response in ["Net::HTTPInformation", "Net::HTTPRedirection", "Net::HTTPOK", "Net::HTTPSuccess"] {
         register_stdlib_class(classes, response, &[], &[]);
     }
     // The implementation is bundled on Ruby/Spinel. Other targets
@@ -1385,10 +1422,27 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // require; on Spinel by its fileutils / openssl package.
     register_stdlib_class(classes, "GC", &[("start", Ty::Nil)], &[]);
     register_stdlib_class(classes, "OpenSSL::HMAC", &[("digest", Ty::Str), ("hexdigest", Ty::Str)], &[]);
+    register_stdlib_class(classes, "OpenSSL", &[("fixed_length_secure_compare", Ty::Bool), ("secure_compare", Ty::Bool)], &[]);
+    register_stdlib_class(classes, "OpenSSL::KDF", &[("hkdf", Ty::Str)], &[]);
+    // Spinel's GCM surface; constructors and mode switches preserve the receiving subclass.
+    register_stdlib_class(classes, "OpenSSL::Cipher", &[("new", Ty::SelfInstance)], &[
+        ("encrypt", Ty::SelfInstance), ("decrypt", Ty::SelfInstance),
+        ("update", Ty::Str), ("final", Ty::Str), ("auth_tag", Ty::Str),
+        ("random_key", Ty::Str), ("random_iv", Ty::Str),
+        ("key=", Ty::Str), ("iv=", Ty::Str), ("auth_tag=", Ty::Str), ("auth_data=", Ty::Str),
+    ]);
+    register_stdlib_class(classes, "OpenSSL::PKey", &[("read", Ty::Untyped), ("new_raw_private_key", class("OpenSSL::PKey::PKey"))], &[]);
+    register_stdlib_class(classes, "OpenSSL::PKey::PKey", &[], &[("sign", Ty::Str)]);
+    register_stdlib_class(classes, "OpenSSL::PKey::EC", &[("generate", Ty::Untyped)], &[
+        ("private?", Ty::Bool), ("group", class("OpenSSL::PKey::EC::Group")),
+        ("public_to_der", Ty::Str), ("private_to_der", Ty::Str), ("private_to_pem", Ty::Str),
+        ("dsa_sign_asn1", Ty::Str), ("dsa_verify_asn1", Ty::Bool),
+    ]);
+    register_stdlib_class(classes, "OpenSSL::PKey::EC::Group", &[], &[("curve_name", Ty::Str)]);
     // `OpenSSL::HMAC.digest(OpenSSL::Digest.new("sha1"), key, data)`: rotp's one-time codes.
-    for name in ["OpenSSL::Digest", "OpenSSL::Digest::SHA1", "OpenSSL::Digest::SHA256"] {
+    for name in ["OpenSSL::Digest", "OpenSSL::Digest::SHA1", "OpenSSL::Digest::SHA256", "OpenSSL::Digest::SHA384", "OpenSSL::Digest::SHA512"] {
         let digest = Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() };
-        register_stdlib_class(classes, name, &[("new", digest)], &[
+        register_stdlib_class(classes, name, &[("new", if matches!(name, "OpenSSL::Digest::SHA384" | "OpenSSL::Digest::SHA512") { Ty::Untyped } else { digest })], &[
             ("name", Ty::Str), ("digest", Ty::Str), ("hexdigest", Ty::Str),
         ]);
         if name != "OpenSSL::Digest" {
@@ -1474,6 +1528,31 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ]);
     }
     register_stdlib_class(classes, "Mutex", &[], &[]);
+    // `require "weakref"`: Ruby's own on the ruby family, packages/weakref
+    // on spinel. `__getobj__` answers whatever the reference was made over,
+    // so it stays untyped. `weakref_alive?` is true, nil once the object is
+    // collected, and the String "instance-variable" for a reference to
+    // true, false or nil. The referent's other methods are not modeled on
+    // the reference: CRuby forwards them through method_missing, spinel's
+    // package does not, so an app that runs on both reads the object with
+    // `__getobj__` and calls that. Spinel hands out no weak references:
+    // its package keeps the referent alive as long as the WeakRef, and
+    // `weakref_alive?` is always true there, so a WeakRef-keyed cache that
+    // frees memory on the ruby family never frees it on spinel.
+    let weak_ref = class("WeakRef");
+    register_stdlib_class(classes, "WeakRef", &[("new", weak_ref)], &[
+        ("weakref_alive?", Ty::Union { variants: vec![Ty::Bool, Ty::Str, Ty::Nil].into() }),
+        ("__getobj__", Ty::Untyped), ("__setobj__", Ty::Untyped),
+    ]);
+    // `require "observer"`: the mixin an `include Observable` names. Its
+    // methods answer what observer.rb's do: `changed` and `changed?` the
+    // state flag, `count_observers` the count; the rest hand back the
+    // observer list or an observer, which no caller reads.
+    register_stdlib_class(classes, "Observable", &[], &[
+        ("add_observer", Ty::Untyped), ("delete_observer", Ty::Untyped), ("delete_observers", Ty::Untyped),
+        ("count_observers", Ty::Int), ("changed", Ty::Bool), ("changed?", Ty::Bool),
+        ("notify_observers", Ty::Untyped),
+    ]);
     // The queue constructors, Thread's core aliases, and the standard
     // mixins likewise need exact entries for source constant resolution.
     // No queue element, synchronization or mixin method types are added;
@@ -1649,3 +1728,6 @@ const ERRNO_CLASSES: &[&str] = &[
     "ENOBUFS", "EISCONN", "ENOTCONN", "ETIMEDOUT", "ECONNREFUSED", "EHOSTUNREACH",
     "EALREADY", "EINPROGRESS", "ESTALE", "EDQUOT", "ECANCELED", "EOVERFLOW", "EILSEQ",
 ];
+
+/// The formats `Mime::Type` answers a predicate for (`runtime/ruby/mime.rb` SYMBOLS).
+const MIME_PREDICATES: &[&str] = &["atom", "bmp", "css", "csv", "gif", "gzip", "html", "ics", "jpeg", "js", "json", "m4a", "md", "mp3", "mp4", "mpeg", "multipart_form", "ogg", "otf", "pdf", "png", "rss", "svg", "text", "tiff", "ttf", "turbo_stream", "url_encoded_form", "vcf", "vtt", "webm", "webp", "woff", "woff2", "xml", "yaml", "zip"];

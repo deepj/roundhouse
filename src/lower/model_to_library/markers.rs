@@ -405,10 +405,64 @@ pub(crate) fn declared_attr_names(model: &Model) -> Vec<Symbol> {
     out
 }
 
+pub(crate) fn readonly_attr_types(model: &Model) -> crate::det::HashMap<Symbol, Ty> {
+    let mut readers = crate::det::HashSet::default();
+    let mut writers = crate::det::HashSet::default();
+    for item in &model.body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { continue };
+        let names = accessor_names(model, args);
+        match method.as_str() {
+            "attr_reader" => readers.extend(names),
+            "attr_accessor" | "attr_writer" => writers.extend(names),
+            _ => {}
+        }
+    }
+    let mut writes = crate::det::HashMap::default();
+    let mut unknown_writes = crate::det::HashSet::default();
+    fn collect_unknown(expr: &Expr, out: &mut crate::det::HashSet<Symbol>) {
+        match &*expr.node {
+            ExprNode::Assign { target: LValue::Ivar { name }, value }
+            | ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. }
+                if value.ty.as_ref().is_none_or(Ty::mentions_unknown)
+                    || value.decisions & crate::expr::CLASS_OBJECT_VALUE != 0 =>
+            {
+                out.insert(name.clone());
+            }
+            ExprNode::MultiAssign { targets, .. } => {
+                out.extend(targets.iter().filter_map(|t| match t {
+                    LValue::Ivar { name } => Some(name.clone()),
+                    _ => None,
+                }));
+            }
+            _ => {}
+        }
+        expr.node.for_each_child(&mut |e| collect_unknown(e, out));
+    }
+    for method in model.methods().filter(|m| m.receiver == MethodReceiver::Instance) {
+        crate::analyze::extract_ivar_assignments(&method.body, &mut writes);
+        collect_unknown(&method.body, &mut unknown_writes);
+    }
+    readers.into_iter().filter_map(|name| {
+        if writers.contains(&name) || unknown_writes.contains(&name)
+            || crate::lower::model_to_library::model_defines_instance_method(model, &name)
+            || crate::lower::model_to_library::model_defines_instance_method(model, &Symbol::from(format!("{}=", name.as_str())))
+        {
+            return None;
+        }
+        let ty = writes.remove(&name)?;
+        if !matches!(ty.peel_nilable(), Ty::Class { .. }) {
+            return None;
+        }
+        Some((name, crate::analyze::union_of(ty, Ty::Nil)))
+    }).collect()
+}
+
 pub(super) fn push_attr_accessor_methods(methods: &mut Vec<MethodDef>, model: &Model) {
     if is_primary_abstract_class(model) {
         return;
     }
+    let reader_types = readonly_attr_types(model);
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
@@ -465,8 +519,11 @@ pub(super) fn push_attr_accessor_methods(methods: &mut Vec<MethodDef>, model: &M
                     name: name.clone(),
                     receiver: MethodReceiver::Instance,
                     params: Vec::new(),
-                    body: Expr::new(expr.span, ExprNode::Ivar { name: name.clone() }),
-                    signature: None,
+                    body: reader_types.get(name).map_or_else(
+                        || Expr::new(expr.span, ExprNode::Ivar { name: name.clone() }),
+                        |ty| with_ty(Expr::new(expr.span, ExprNode::Ivar { name: name.clone() }), ty.clone()),
+                    ),
+                    signature: reader_types.get(name).map(|ty| fn_sig(Vec::new(), ty.clone())),
                     effects: EffectSet::default(),
                     enclosing_class: Some(model.name.0.clone()),
                     kind: AccessorKind::AttributeReader,
@@ -1533,10 +1590,10 @@ fn str_method(model: &Model, name: &str, body: Expr) -> MethodDef {
 /// `attached.rs` already uses for the same reason.
 ///
 /// Rails guards the update hook with `if: :saved_changes?` and skips
-/// the touch when nothing actually changed. This runtime's `save`
-/// issues an unconditional UPDATE, so there is no no-op save to skip
-/// and the guard would never be false — omitted rather than emitted
-/// as a constant true.
+/// the touch when nothing actually changed. The update hook here asks
+/// `_wrote_on_update?`: the ruby-family runtime skips an update with
+/// nothing pending and answers from `saved_changes`; a strict target's
+/// `save` writes the whole row every time and answers true.
 fn push_belongs_to_touches(methods: &mut Vec<MethodDef>, model: &Model) {
     for assoc in model.associations() {
         let crate::dialect::Association::BelongsTo { name, touch: Some(touch), .. } = assoc else {
@@ -1635,7 +1692,29 @@ fn push_belongs_to_touches(methods: &mut Vec<MethodDef>, model: &Model) {
         );
 
         for hook in ["after_create", "after_update", "after_destroy", "after_touch"] {
-            fold_into_or_push(methods, model, hook, seq(vec![bind.clone(), stmt.clone()]));
+            let body = seq(vec![bind.clone(), stmt.clone()]);
+            let body = if hook == "after_update" {
+                Expr::new(
+                    span,
+                    ExprNode::If {
+                        cond: Expr::new(
+                            span,
+                            ExprNode::Send {
+                                recv: None,
+                                method: Symbol::from("_wrote_on_update?"),
+                                args: vec![],
+                                block: None,
+                                parenthesized: false,
+                            },
+                        ),
+                        then_branch: body,
+                        else_branch: Expr::new(span, ExprNode::Lit { value: Literal::Nil }),
+                    },
+                )
+            } else {
+                body
+            };
+            fold_into_or_push(methods, model, hook, body);
         }
     }
 }
