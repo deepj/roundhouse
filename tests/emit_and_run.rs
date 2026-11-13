@@ -14,6 +14,9 @@ mod data_record_siblings;
 mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
+#[path = "support/native_http.rs"]
+#[allow(dead_code)]
+mod native_http;
 #[path = "emit_and_run/deep_stringify_keys.rs"]
 mod deep_stringify_keys;
 #[path = "emit_and_run/controller_content_type_writer.rs"]
@@ -22,6 +25,8 @@ mod controller_content_type_writer;
 mod time_change_usec_contract;
 #[path = "emit_and_run/time_change_usec.rs"]
 mod time_change_usec;
+#[path = "emit_and_run/controller_constant_rooting.rs"]
+mod controller_constant_rooting;
 #[path = "emit_and_run/rate_limits.rs"]
 mod rate_limits;
 #[path = "emit_and_run/config_for.rs"]
@@ -138,6 +143,34 @@ mod gem_class_macros;
 mod source_gem_autoload;
 #[path = "emit_and_run/source_gem_load_order.rs"]
 mod source_gem_load_order;
+#[path = "emit_and_run/gem_file_statements.rs"]
+mod gem_file_statements;
+#[path = "emit_and_run/uncalled_config_writers.rs"]
+mod uncalled_config_writers;
+#[path = "emit_and_run/gem_mailer_reach.rs"]
+mod gem_mailer_reach;
+#[path = "emit_and_run/helper_method_splat.rs"]
+mod helper_method_splat;
+#[path = "emit_and_run/constant_branches.rs"]
+mod constant_branches;
+#[path = "emit_and_run/defined_method_query.rs"]
+mod defined_method_query;
+#[path = "emit_and_run/metal_subclass.rs"]
+mod metal_subclass;
+#[path = "emit_and_run/association_reflection.rs"]
+mod association_reflection;
+#[path = "emit_and_run/human_attribute_name_dynamic.rs"]
+mod human_attribute_name_dynamic;
+#[path = "emit_and_run/boot_with_options.rs"]
+mod boot_with_options;
+#[path = "support/class_param_or_assign.rs"]
+mod class_param_or_assign_app;
+#[path = "emit_and_run/class_param_or_assign.rs"]
+mod class_param_or_assign;
+#[path = "emit_and_run/forwarded_block_reach.rs"]
+mod forwarded_block_reach;
+#[path = "emit_and_run/superclass_respond_to.rs"]
+mod superclass_respond_to;
 #[path = "emit_and_run/unresolved_param_rbs.rs"]
 mod unresolved_param_rbs;
 #[path = "emit_and_run/declared_sig_rbs.rs"]
@@ -164,6 +197,14 @@ mod stdlib_scan_zlib;
 mod stdlib_rexml_include_contract;
 #[path = "emit_and_run/stdlib_rexml_include.rs"]
 mod stdlib_rexml_include;
+#[path = "support/gem_reopen_source.rs"]
+mod gem_reopen_source_contract;
+#[path = "emit_and_run/gem_reopen_source.rs"]
+mod gem_reopen_source;
+#[path = "support/stdlib_singleton.rs"]
+mod stdlib_singleton_contract;
+#[path = "emit_and_run/stdlib_singleton.rs"]
+mod stdlib_singleton;
 #[path = "support/mutable_literals.rs"]
 mod mutable_literals_contract;
 #[path = "emit_and_run/mutable_literals.rs"]
@@ -172,6 +213,14 @@ mod mutable_literals;
 mod auto_source_gem_contract;
 #[path = "emit_and_run/auto_source_gem.rs"]
 mod auto_source_gem;
+#[path = "support/gem_method_require.rs"]
+mod gem_method_require_contract;
+#[path = "emit_and_run/gem_method_require.rs"]
+mod gem_method_require;
+#[path = "support/block_arg_conditional.rs"]
+mod block_arg_conditional_contract;
+#[path = "emit_and_run/block_arg_conditional.rs"]
+mod block_arg_conditional;
 #[path = "emit_and_run/pay_exceptions.rs"]
 mod pay_exceptions;
 #[path = "emit_and_run/net_http_patch.rs"]
@@ -306,6 +355,8 @@ mod representable;
 mod active_model_serializer_app;
 #[path = "emit_and_run/active_model_serializer.rs"]
 mod active_model_serializer;
+#[path = "emit_and_run/serializer_scope.rs"]
+mod serializer_scope;
 #[path = "emit_and_run/instance_extend.rs"]
 mod instance_extend;
 
@@ -387,6 +438,14 @@ mod json_params;
 mod class_side_default_contract;
 #[path = "emit_and_run/class_side_default.rs"]
 mod class_side_default;
+#[path = "support/hash_write_through_reader.rs"]
+mod hash_write_through_reader_contract;
+#[path = "emit_and_run/hash_write_through_reader.rs"]
+mod hash_write_through_reader;
+#[path = "support/app_class_registry.rs"]
+mod app_class_registry_contract;
+#[path = "emit_and_run/app_class_registry.rs"]
+mod app_class_registry;
 #[path = "emit_and_run/helper_anonymous_rest.rs"]
 mod helper_anonymous_rest;
 #[path = "emit_and_run/controller_response_body.rs"]
@@ -539,6 +598,10 @@ mod format_allow_nil_blank;
 mod format_value_to_s;
 #[path = "emit_and_run/validates_acceptance.rs"]
 mod validates_acceptance;
+#[path = "emit_and_run/validates_of_confirmation.rs"]
+mod validates_of_confirmation;
+#[path = "emit_and_run/respond_to_fold.rs"]
+mod respond_to_fold;
 #[path = "emit_and_run/attribute_api_boolean_cast.rs"]
 mod attribute_api_boolean_cast;
 #[path = "emit_and_run/hash_fetch_one_arg.rs"]
@@ -11060,6 +11123,134 @@ puts "ok"
         .assert_passes();
 }
 
+/// `row.pluralize` on a receiver of no settled type, in a controller. An
+/// app class outside the controllers that defines `pluralize` owns the
+/// call (Rails 8.1.4 dispatches to it).
+fn an_untyped_pluralize_receiver_app() -> emit_and_run::Overlay {
+    emit_and_run::real_blog().write(
+        "app/controllers/probes_controller.rb",
+        r#"class ProbesController < ApplicationController
+  def tag_of(row)
+    row.pluralize
+  end
+end
+"#,
+    )
+}
+
+#[test]
+fn a_library_class_pluralize_owns_an_untyped_controller_call() {
+    an_untyped_pluralize_receiver_app()
+        .write("app/models/label.rb", "class Label\n  def pluralize\n    \"custom\"\n  end\nend\n")
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+raise "library class override lost" unless ProbesController.allocate.tag_of(Label.new) == "custom"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+#[test]
+fn a_model_pluralize_owns_an_untyped_controller_call() {
+    an_untyped_pluralize_receiver_app()
+        .write(
+            "app/models/comment.rb",
+            r#"class Comment < ApplicationRecord
+  belongs_to :article
+  validates :body, presence: true
+
+  def pluralize
+    "custom"
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+raise "model override lost" unless ProbesController.allocate.tag_of(Comment.new) == "custom"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// Only a String has `pluralize` (Rails 8.1.4 raises NoMethodError on a number).
+#[test]
+fn a_number_raises_in_an_untyped_controller_call() {
+    an_untyped_pluralize_receiver_app()
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+begin
+  out = ProbesController.allocate.tag_of(5)
+  raise "answered: #{out}"
+rescue NoMethodError => e
+  raise e.message unless e.message == "undefined method 'pluralize' for an instance of Integer"
+end
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// Two helpers define it, and each name indexes only one of them.
+#[test]
+fn two_helpers_pluralize_leave_an_untyped_controller_call_lowered() {
+    an_untyped_pluralize_receiver_app()
+        .write(
+            "app/helpers/application_helper.rb",
+            "module ApplicationHelper\n  def pluralize(count, word)\n    \"custom\"\n  end\nend\n",
+        )
+        .write(
+            "app/helpers/other_helper.rb",
+            "module OtherHelper\n  def pluralize(count, word)\n    \"other\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+out = ProbesController.allocate.tag_of("status")
+raise "helper took the call: #{out}" unless out == "statuses"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// The same inside the helper module that defines it (Rails 8.1.4 answers
+/// `statuses` from `word.pluralize` there).
+#[test]
+fn a_helper_pluralize_leaves_its_own_untyped_call_lowered() {
+    emit_and_run::real_blog()
+        .write(
+            "app/helpers/application_helper.rb",
+            "module ApplicationHelper\n  def pluralize(count, word)\n    \"custom\"\n  end\n\n  def plural_of(word)\n    word.pluralize\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"out = ApplicationHelper.plural_of("status")
+raise "helper took the call: #{out}" unless out == "statuses"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
+/// A helper's `pluralize(count, word)` is not what `row.pluralize` reaches.
+#[test]
+fn a_helper_pluralize_leaves_an_untyped_controller_call_lowered() {
+    an_untyped_pluralize_receiver_app()
+        .write(
+            "app/helpers/application_helper.rb",
+            "module ApplicationHelper\n  def pluralize(count, word)\n    \"custom\"\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"require_relative "app/controllers/probes_controller"
+out = ProbesController.allocate.tag_of("status")
+raise "helper took the call: #{out}" unless out == "statuses"
+puts "ok"
+"#,
+        )
+        .assert_passes();
+}
+
 #[test]
 fn an_app_tag_helper_override_owns_helper_and_view_calls() {
     emit_and_run::real_blog()
@@ -13230,10 +13421,8 @@ puts "string inflections passed"
     assert!(run.stdout.contains("string inflections passed"), "{}", run.stdout);
 }
 
-/// #293: `tableize` needs Rails' plural rules, which the runtime does not
-/// carry (its `pluralize_word` keeps a word that ends in "s", where Rails
-/// answers "statuses"). It is refused at check time, not emitted onto a
-/// String no runtime reopens.
+/// #293: `tableize` has no runtime body. It is refused at check time, not
+/// emitted onto a String no runtime reopens.
 #[test]
 fn string_extensions_without_a_runtime_body_are_refused() {
     for (call, method) in [(r#""Status".tableize"#, "tableize")] {
@@ -16041,6 +16230,8 @@ end
 mod relation_finders;
 #[path = "emit_and_run/attach_hash.rs"]
 mod attach_hash;
+#[path = "emit_and_run/attached_record.rs"]
+mod attached_record;
 #[path = "emit_and_run/many_attached.rs"]
 mod many_attached;
 
@@ -20937,6 +21128,10 @@ mod resource_dynamic_path;
 mod enumerable_mixin_contract;
 #[path = "emit_and_run/enumerable_mixin.rs"]
 mod enumerable_mixin;
+#[path = "support/enum_where_runtime_cast.rs"]
+mod enum_where_runtime_cast_contract;
+#[path = "emit_and_run/enum_where_runtime_cast.rs"]
+mod enum_where_runtime_cast;
 #[path = "support/file_level_struct.rs"]
 mod file_level_struct_contract;
 #[path = "emit_and_run/file_level_struct.rs"]
@@ -20945,6 +21140,8 @@ mod file_level_struct;
 mod concern_class_side_contract;
 #[path = "emit_and_run/concern_class_side.rs"]
 mod concern_class_side;
+#[path = "emit_and_run/controller_concern_class_methods.rs"]
+mod controller_concern_class_methods;
 #[path = "support/concern_define_loop.rs"]
 mod concern_define_loop_contract;
 #[path = "emit_and_run/concern_define_loop.rs"]
@@ -20955,6 +21152,8 @@ mod mutated_loop_constant;
 mod solid_queue_worker_contract;
 #[path = "emit_and_run/solid_queue_surface.rs"]
 mod solid_queue_surface;
+#[path = "emit_and_run/included_block_attribute_writes.rs"]
+mod included_block_attribute_writes;
 #[path = "emit_and_run/controller_surface.rs"]
 mod controller_surface;
 #[path = "emit_and_run/rack_attack.rs"]
@@ -20965,8 +21164,12 @@ mod devise;
 mod warden;
 #[path = "emit_and_run/class_eval_string_macro.rs"]
 mod class_eval_string_macro;
+#[path = "emit_and_run/primary_key_send.rs"]
+mod primary_key_send;
 #[path = "emit_and_run/send_built_name.rs"]
 mod send_built_name;
+#[path = "emit_and_run/app_middleware.rs"]
+mod app_middleware;
 #[path = "support/addressable_gem.rs"]
 mod addressable_gem;
 #[path = "emit_and_run/addressable.rs"]
@@ -21953,3 +22156,57 @@ fn join_nil_renders_as_rails() {
 }
 #[path = "emit_and_run/cable_connection_request.rs"]
 mod cable_connection_request;
+#[path = "emit_and_run/respond_with.rs"]
+mod respond_with;
+#[path = "emit_and_run/respond_with_json.rs"]
+mod respond_with_json;
+#[path = "emit_and_run/respond_with_resource_location.rs"]
+mod respond_with_resource_location;
+#[path = "emit_and_run/route_loop_index.rs"]
+mod route_loop_index;
+#[path = "emit_and_run/deprecation.rs"]
+mod deprecation;
+#[path = "emit_and_run/loaded_begin.rs"]
+mod loaded_begin;
+#[path = "emit_and_run/class_eval_definer_call.rs"]
+mod class_eval_definer_call;
+#[path = "emit_and_run/custom_form_builder.rs"]
+mod custom_form_builder;
+#[path = "emit_and_run/simple_form.rs"]
+mod simple_form;
+#[path = "emit_and_run/classvar_block_initializers.rs"]
+mod classvar_block_initializers;
+#[path = "emit_and_run/concern_class_settings.rs"]
+mod concern_class_settings;
+#[path = "emit_and_run/load_time_constants.rs"]
+mod load_time_constants;
+#[path = "emit_and_run/doorkeeper.rs"]
+mod doorkeeper;
+#[path = "emit_and_run/model_mixin_macro.rs"]
+mod model_mixin_macro;
+#[path = "emit_and_run/controller_append_callbacks.rs"]
+mod controller_append_callbacks;
+#[path = "emit_and_run/routing_method_boot_state.rs"]
+mod routing_method_boot_state;
+#[path = "emit_and_run/boot_base_mixins.rs"]
+mod boot_base_mixins;
+#[path = "emit_and_run/array_grep_extract_options.rs"]
+mod array_grep_extract_options;
+#[path = "emit_and_run/load_time_string_definer.rs"]
+mod load_time_string_definer;
+#[path = "emit_and_run/mime_extension_lookup.rs"]
+mod mime_extension_lookup;
+#[path = "emit_and_run/self_class_argument.rs"]
+mod self_class_argument;
+#[path = "emit_and_run/form_for_record.rs"]
+mod form_for_record;
+#[path = "support/library_concern_included_include.rs"]
+mod library_concern_included_include_contract;
+#[path = "emit_and_run/library_concern_included_include.rs"]
+mod library_concern_included_include;
+#[path = "emit_and_run/param_default_constant_rooting.rs"]
+mod param_default_constant_rooting;
+#[path = "emit_and_run/compiled_rooted_constants.rs"]
+mod compiled_rooted_constants;
+#[path = "emit_and_run/serializable_resource_as_json.rs"]
+mod serializable_resource_as_json;

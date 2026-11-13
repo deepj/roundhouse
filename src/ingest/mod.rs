@@ -16,8 +16,9 @@
 //! cross-cutting Prism AST helpers live in [`util`].
 
 mod alba;
+mod built_send;
 mod conditional_permit;
-mod unreachable_views;
+pub(crate) mod unreachable_views;
 mod locale_templates;
 mod view_paths;
 mod uncalled_helper_copies;
@@ -35,16 +36,20 @@ pub(crate) mod has_many_hold;
 pub(crate) mod mailer_helpers;
 pub(crate) mod class_attribute;
 mod class_configuration;
-pub(crate) use concern_accessors::unconsumed_class_side_hook;
+pub(crate) use concern_accessors::{library_classes_by_name, unconsumed_class_side_hook, LibraryClassesByName};
 mod dry_initializer;
 mod dry_struct;
 mod dry_types;
 mod oj;
 pub(crate) mod source_gems;
 mod auto_source_gems;
+mod aliased_includes;
 mod forwardable;
 mod railtie_middleware;
-mod absence_guards;
+pub(crate) mod absence_guards;
+mod stdlib_features;
+pub(crate) mod source_gem_autoload;
+mod metal_actions;
 mod uncalled_definers;
 mod job_class_lookup;
 mod settled_conditionals;
@@ -70,11 +75,14 @@ mod engine_config;
 mod engine_helpers;
 mod interpolated_renders;
 mod container_specialize;
+mod controller_class_methods;
 mod controller_delegates;
 mod active_model_super;
 mod queue_adapter_reader;
 mod library_concern_items;
 mod unreached_gem_modules;
+mod gem_load_program;
+mod option_merger;
 pub(crate) mod puma_boot;
 pub mod allow_browser;
 pub mod app;
@@ -95,6 +103,10 @@ pub mod generated_helpers;
 pub mod jbuilder;
 pub mod library_class;
 mod file_program;
+pub(crate) use file_program::{normalize_source, resolve_gem_require};
+pub(crate) fn source_gems_mount() -> &'static str {
+    source_gems::MOUNT
+}
 mod glob_autoload;
 pub mod channel_callbacks;
 mod active_model_attributes;
@@ -117,6 +129,7 @@ pub(crate) mod inherited_alias;
 mod class_macros;
 mod configured_superclass;
 mod gem_hooks;
+pub(crate) use gem_hooks::method_missing_readers;
 mod gem_routes;
 mod column_accessors;
 mod model_macros;
@@ -211,6 +224,16 @@ impl std::fmt::Display for IngestError {
 }
 
 impl std::error::Error for IngestError {}
+
+/// Render the current failure before another ingest replaces its noted source site.
+pub fn render_error(err: &IngestError) -> String {
+    if let IngestError::Unsupported { file, message } = err
+        && let Some((start, _)) = error_site::of(err)
+        && let Some(line) = sources::line_at(file, start) {
+        return format!("unsupported construct in {file}:{line}: {message}");
+    }
+    err.to_string()
+}
 
 impl From<std::io::Error> for IngestError {
     fn from(e: std::io::Error) -> Self {

@@ -18,6 +18,7 @@ use crate::dialect::{AccessorKind, LibraryClass, LibraryClassOrigin, MethodDef, 
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
+use crate::lower::view_to_library::hoist_constants::{hoist_pure_helper_constants, is_view_helpers_const};
 use crate::ty::Ty;
 
 /// Base's shared methods return Base in the runtime sidecar. A concrete
@@ -218,43 +219,49 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
         }
     }
 
-    lcs.iter()
+    // Each file is rendered on its own: the passes above did the
+    // lowering, and what a render reads is the same for every class.
+    let roots: Vec<&LibraryClass> = lcs
+        .iter()
         .filter(|lc| !is_spliced_factory(lc))
         .filter(|lc| !matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })))
         .filter(|lc| owner_in_this_tree(lc).is_none())
-        .flat_map(|lc| {
-            // `underscore`, not `snake_case`: a namespaced reopen
-            // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
-            // `ShortId::CandidateId`) nests as `active_record/base.rb` —
-            // a literal `::` in the filename breaks the emitted
-            // Makefile's dependency list.
-            let file_stem = crate::naming::underscore(lc.name.0.as_str());
-            let out_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
-            let mut files = match children.get(lc.name.0.as_str()) {
-                Some(kids) => emit_library_class_with_nested(lc, kids, app, classes, &factories, out_path),
-                None => emit_library_class_pair_in(lc, app, classes, &factories, out_path),
-            };
-            for block in &data_blocks {
-                splice_data_block(&mut files, block, app, classes, &factories);
+        .collect();
+    super::par_render::map(app, classes, &roots, |&lc| {
+        // `underscore`, not `snake_case`: a namespaced reopen
+        // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
+        // `ShortId::CandidateId`) nests as `active_record/base.rb` —
+        // a literal `::` in the filename breaks the emitted
+        // Makefile's dependency list.
+        let file_stem = crate::naming::underscore(lc.name.0.as_str());
+        let out_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
+        let mut files = match children.get(lc.name.0.as_str()) {
+            Some(kids) => emit_library_class_with_nested(lc, kids, app, classes, &factories, out_path),
+            None => emit_library_class_pair_in(lc, app, classes, &factories, out_path),
+        };
+        for block in &data_blocks {
+            splice_data_block(&mut files, block, app, classes, &factories);
+        }
+        files
+    })
+    .into_iter()
+    .flatten()
+    .fold((Vec::<EmittedFile>::new(), HashMap::<PathBuf, usize>::default()), |(mut out, mut at), file| {
+        // Not left to the tree's last-wins dedupe: a module opened in two files (rolify's `Rolify`) would lose one opening's methods.
+        match at.get(&file.path) {
+            Some(&i) if out[i].content == file.content => {}
+            Some(&i) => {
+                out[i].content.push('\n');
+                out[i].content.push_str(&file.content);
             }
-            files
-        })
-        .fold((Vec::<EmittedFile>::new(), HashMap::<PathBuf, usize>::default()), |(mut out, mut at), file| {
-            // Not left to the tree's last-wins dedupe: a module opened in two files (rolify's `Rolify`) would lose one opening's methods.
-            match at.get(&file.path) {
-                Some(&i) if out[i].content == file.content => {}
-                Some(&i) => {
-                    out[i].content.push('\n');
-                    out[i].content.push_str(&file.content);
-                }
-                None => {
-                    at.insert(file.path.clone(), out.len());
-                    out.push(file);
-                }
+            None => {
+                at.insert(file.path.clone(), out.len());
+                out.push(file);
             }
-            (out, at)
-        })
-        .0
+        }
+        (out, at)
+    })
+    .0
 }
 
 /// A class opened in several gem files (graphql-client's `Client`, in
@@ -3601,6 +3608,17 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
     let view_ivars = view_assigned_ivars(app);
     // Instance-method names the app defines anywhere that collide with a
     // framework view helper; only these need the ancestry lookup above.
+    // Read from the whole app, not this run's slice: a controller's untyped
+    // receiver can be a model or a library class. A helper's `pluralize` is
+    // called bare, so a receiver never reaches one. The index names one
+    // module per method, so a second helper defining it is only in
+    // `app.helper_modules`.
+    let app_defines_pluralize = app.models.iter().any(|m| m.methods().any(|d| d.name.as_str() == "pluralize"))
+        || lcs
+            .iter()
+            .chain(app.library_classes.iter())
+            .filter(|lc| !helper_modules.contains(&lc.name) && !app.helper_modules.contains(&lc.name))
+            .any(|lc| lc.methods.iter().any(|m| m.name.as_str() == "pluralize"));
     let app_framework_helper_names: BTreeSet<String> = app
         .models
         .iter()
@@ -3742,6 +3760,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                     &own_params,
                     &app.view_visible_controller_methods,
                 );
+                ground_string_pluralize(default, app_defines_pluralize);
                 if is_helper_module {
                     rewrite_helper_ivars(default, &helper_ivars);
                 }
@@ -3756,6 +3775,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                 &own_params,
                 &app.view_visible_controller_methods,
             );
+            ground_string_pluralize(&mut m.body, app_defines_pluralize);
             // A CONTROLLER IVAR read in a helper body. Rails mixes
             // helpers into the view instance, which carries the
             // controller's assigns, so `@room` there IS the
@@ -4227,300 +4247,6 @@ fn is_framework_view_helper(name: &str) -> bool {
     )
 }
 
-/// Is this a call on `ActionView::ViewHelpers` (or a bare `ViewHelpers`
-/// const)? Shared by the post-rewrite transforms below.
-fn is_view_helpers_const(e: &Expr) -> bool {
-    matches!(&*e.node, ExprNode::Const { path }
-        if path.last().map(|s| s.as_str() == "ViewHelpers").unwrap_or(false))
-}
-
-/// View helpers a call site can be hoisted OUT of, when every argument is
-/// a literal: each is a pure function of its arguments and always returns
-/// a freshly built String.
-///
-/// PURITY IS DECLARED HERE, NOT INFERRED, and the list is grown by
-/// measurement rather than by reasoning about what looks pure. Two traps
-/// make inference the wrong tool:
-///
-///   - `csrf_token_hidden_input` takes NO arguments, so "every argument is
-///     a literal" is vacuously true of it. Hoisting it would compute one
-///     session's token at load and serve it to every reader afterwards.
-///     Arity is not evidence of purity.
-///   - An empty `EffectSet` on the call is not evidence either: it means
-///     the analyzer did not model the callee, not that the callee is pure.
-///
-/// The "freshly built String" half matters as much as the purity half.
-/// `image_path("/already/absolute")` RETURNS ITS ARGUMENT, so hoisting it
-/// would put a literal's own String object in a constant where a caller
-/// could mutate it; the three below all interpolate into a new String.
-///
-/// `stylesheet_link_tag` / `javascript_include_tag` map a literal name to
-/// a path through the immutable emitted asset table, so they are pure
-/// over their literals the way `image_tag`
-/// is; `javascript_importmap_tags` is pure over the importmap table,
-/// which is the one non-literal argument this list admits (see
-/// `HOISTABLE_CONST_READERS`). campfire's layout pays all three on every
-/// page — 27 stylesheet links, and the importmap's 92 pins rebuilt as
-/// Hashes and rendered to JSON — for a header that never changes
-/// between one boot and the next: about 360 allocations per request
-/// that the room page's profile put beside the message loop's.
-const HOISTABLE_TAG_HELPERS: &[&str] = &[
-    "image_tag",
-    "content_tag",
-    "hidden_field_tag",
-    "stylesheet_link_tag",
-    "javascript_include_tag",
-    "javascript_importmap_tags",
-];
-
-/// Argument-less reads of emitted TABLES that a hoistable call may take
-/// as an argument and still be a per-process constant: `Importmap.pins`
-/// and `Importmap.entry` are `config/importmap.rb` rendered as methods
-/// answering literals (see `emit_importmap`), so a call over them is as
-/// constant as a call over the literals themselves. Declared, like the
-/// helpers: a reader is on this list because its body was read, not
-/// because it takes no arguments.
-const HOISTABLE_CONST_READERS: &[(&str, &str)] = &[("Importmap", "pins"), ("Importmap", "entry")];
-
-/// A canonical spelling of an all-literal expression — `None` the moment
-/// any part of it is not a literal. Doubles as the dedupe key, so two call
-/// sites spelled the same way share one constant, and as the guard that
-/// decides whether a call is hoistable at all.
-fn literal_key(e: &Expr) -> Option<String> {
-    match &*e.node {
-        ExprNode::Lit { value } => Some(match value {
-            Literal::Nil => "nil".to_string(),
-            Literal::Bool { value } => format!("b:{value}"),
-            Literal::Int { value } => format!("i:{value}"),
-            Literal::Float { value } => format!("f:{value}"),
-            Literal::Str { value } => format!("s:{value:?}"),
-            Literal::Sym { value } => format!("y:{}", value.as_str()),
-            Literal::Regex { pattern, flags } => format!("r:{pattern:?}/{flags}"),
-        }),
-        ExprNode::Hash { entries, kwargs } => {
-            let mut out = String::from(if *kwargs { "kw{" } else { "h{" });
-            for (k, v) in entries {
-                out.push_str(&literal_key(k)?);
-                out.push_str("=>");
-                out.push_str(&literal_key(v)?);
-                out.push(',');
-            }
-            out.push('}');
-            Some(out)
-        }
-        ExprNode::Array { elements, .. } => {
-            let mut out = String::from("[");
-            for el in elements {
-                out.push_str(&literal_key(el)?);
-                out.push(',');
-            }
-            out.push(']');
-            Some(out)
-        }
-        // An already-hoisted constant is a literal for the purposes of
-        // the call that takes it (a `+` chain over hoisted tags, below).
-        ExprNode::Const { path } if path.len() == 1 && path[0].as_str().starts_with("HOISTED_") => {
-            Some(format!("c:{}", path[0].as_str()))
-        }
-        ExprNode::Send { recv: Some(r), method, args, block: None, .. } if args.is_empty() => {
-            let ExprNode::Const { path } = &*r.node else { return None };
-            let [konst] = path.as_slice() else { return None };
-            HOISTABLE_CONST_READERS
-                .iter()
-                .any(|(k, m)| *k == konst.as_str() && *m == method.as_str())
-                .then(|| format!("{}.{}", konst.as_str(), method.as_str()))
-        }
-        _ => None,
-    }
-}
-
-/// A `+` chain whose every leaf is a hoisted constant or a String
-/// literal — the layout's `stylesheet_link_tag(…) + "\n" +
-/// stylesheet_link_tag(…) + …` once each call is a constant. String `+`
-/// is pure and answers a fresh String, so the WHOLE chain is one more
-/// constant (its key is the chain's spelling); without this the tags
-/// would be hoisted and the 27 concatenations still run per request.
-/// Answers the key for a chain, `None` for anything else — including a
-/// bare leaf, which is not a chain.
-fn hoistable_concat_key(e: &Expr) -> Option<String> {
-    fn leaf_or_chain(x: &Expr) -> Option<String> {
-        match &*x.node {
-            ExprNode::Lit { value: Literal::Str { .. } } => literal_key(x),
-            ExprNode::Const { path } if path.len() == 1 && path[0].as_str().starts_with("HOISTED_") => {
-                literal_key(x)
-            }
-            _ => hoistable_concat_key(x),
-        }
-    }
-    let ExprNode::Send { recv: Some(l), method, args, block: None, .. } = &*e.node else {
-        return None;
-    };
-    if method.as_str() != "+" || args.len() != 1 {
-        return None;
-    }
-    Some(format!("plus({},{})", leaf_or_chain(l)?, leaf_or_chain(&args[0])?))
-}
-
-/// The dedupe key for a hoistable call, or `None` if this expression is
-/// not one: `ActionView::ViewHelpers.<helper>(<literals>)`, no block.
-fn hoistable_call_key(e: &Expr) -> Option<String> {
-    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else {
-        return None;
-    };
-    if !is_view_helpers_const(r) || !HOISTABLE_TAG_HELPERS.contains(&method.as_str()) {
-        return None;
-    }
-    let mut key = format!("{}(", method.as_str());
-    for a in args {
-        key.push_str(&literal_key(a)?);
-        key.push(',');
-    }
-    key.push(')');
-    Some(key)
-}
-
-/// `image_tag("boost.svg", …)` -> `HOISTED_IMAGE_TAG_BOOST_SVG`. The first
-/// String argument names it, because that is what a reader of the emitted
-/// view is looking for; a suffix disambiguates two calls that differ only
-/// in their options.
-fn hoisted_const_name(
-    method: &str,
-    args: &[Expr],
-    used: &mut crate::det::HashSet<String>,
-) -> Symbol {
-    let mut base = format!("HOISTED_{}", method.to_uppercase());
-    if let Some(first) = args.iter().find_map(|a| match &*a.node {
-        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
-        _ => None,
-    }) {
-        let slug: String = first
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
-            .collect();
-        let slug = slug.trim_matches('_').to_string();
-        if !slug.is_empty() {
-            base = format!("{base}_{slug}");
-        }
-    }
-    let mut name = base.clone();
-    let mut n = 2;
-    while !used.insert(name.clone()) {
-        name = format!("{base}_{n}");
-        n += 1;
-    }
-    Symbol::from(name.as_str())
-}
-
-/// Replace hoistable calls in one expression tree with references to
-/// class constants, minting a constant the first time each distinct call
-/// is seen. Children first, so a nested call is hoisted before its parent
-/// is examined (a parent that contains one is not itself all-literal, so
-/// the two can never both fire on the same node).
-fn hoist_in_expr(
-    e: &mut Expr,
-    minted: &mut crate::det::HashMap<String, Symbol>,
-    order: &mut Vec<(Symbol, Expr)>,
-    used: &mut crate::det::HashSet<String>,
-) {
-    hoist_in_expr_at(e, false, minted, order, used)
-}
-
-/// `in_concat`: this node is an operand of a `+` the parent will fold
-/// if the whole chain qualifies — so a qualifying `+` here is left for
-/// the parent, and only the outermost `+` of a chain mints a constant.
-fn hoist_in_expr_at(
-    e: &mut Expr,
-    in_concat: bool,
-    minted: &mut crate::det::HashMap<String, Symbol>,
-    order: &mut Vec<(Symbol, Expr)>,
-    used: &mut crate::det::HashSet<String>,
-) {
-    let child_in_concat = matches!(&*e.node, ExprNode::Send { method, args, block: None, .. }
-        if method.as_str() == "+" && args.len() == 1);
-    e.node.for_each_child_mut(&mut |c| hoist_in_expr_at(c, child_in_concat, minted, order, used));
-    let (key, label) = match hoistable_call_key(e) {
-        Some(key) => (key, None),
-        None => match hoistable_concat_key(e) {
-            Some(key) => (key, Some("concat")),
-            None => return,
-        },
-    };
-    // A chain is hoisted at its TOP: a `+` whose parent is also a `+`
-    // over the same kind of leaves is folded by the parent, so the
-    // whole chain becomes one constant rather than one per operator.
-    if label.is_some() && in_concat {
-        return;
-    }
-    let name = match minted.get(&key) {
-        Some(name) => name.clone(),
-        None => {
-            let ExprNode::Send { method, args, .. } = &*e.node else { unreachable!() };
-            let name = match label {
-                Some(label) => hoisted_const_name(label, &[], used),
-                None => hoisted_const_name(method.as_str(), args, used),
-            };
-            minted.insert(key, name.clone());
-            order.push((name.clone(), e.clone()));
-            name
-        }
-    };
-    let span = e.span;
-    let ty = e.ty.clone();
-    *e = Expr::new(span, ExprNode::Const { path: vec![name] });
-    e.ty = ty;
-}
-
-/// Hoist a pure view-helper call whose arguments are all literals to a
-/// class constant, so the string it always produces is built once at load
-/// rather than on every call.
-///
-/// WHY THIS IS WORTH A PASS. campfire's `_actions.rb` calls `image_tag`
-/// seven times per MESSAGE — about 200 times on a 40-message room page —
-/// and each call allocates the options hash, the nested `aria:` hash,
-/// another hash from `opts.to_h`, the materialised key/value pairs, then
-/// an array and a string per attribute in `render_attrs`, to produce a
-/// byte-identical `<img>` tag every time. Profiled on the spinel binary,
-/// `image_tag` was 13.9% of the whole server's CPU on `/rooms/1`, and
-/// `sp_PolyArray_new` was the single hottest leaf underneath it. Hoisting
-/// those seven took the page from 206 to 224-238 req/s, byte-identical.
-///
-/// Hoisting rather than constant-FOLDING is deliberate: computing the
-/// string in Rust here would make a second implementation of `image_tag`
-/// that can drift from the runtime's, and the emitted constant keeps the
-/// one implementation while paying it once per process.
-///
-/// NAMES ARE UNIQUE ACROSS THE WHOLE SLICE, not per class, and that is not
-/// tidiness. campfire's `_actions.rb` and `_template.rb` are two
-/// LibraryClasses that both reopen `Views::Messages`, and both ask for the
-/// same icon — one with `size: 20` and one without. Named per class they
-/// both minted `HOISTED_IMAGE_TAG_MENU_DOTS_HORIZONTAL_SVG`, whichever
-/// file loaded second silently won, and every message rendered its
-/// options menu with an `<img>` that had lost its `width` and `height`.
-/// `scripts/campfire-compare` caught it against Rails; nothing else would
-/// have. Dedupe stays PER CLASS (a class must define what it references,
-/// since sibling files of one namespace have no load-order contract), so
-/// two files hoisting the identical call get two constants with equal
-/// values — redundant, and the only alternative that is safe.
-fn hoist_pure_helper_constants(lcs: &mut [LibraryClass]) {
-    // Seeded from every class, so a hoisted name can never collide with an
-    // app constant defined in a sibling file of the same namespace either.
-    let mut used: crate::det::HashSet<String> = lcs
-        .iter()
-        .flat_map(|lc| lc.constants.iter().map(|(n, _)| n.as_str().to_string()))
-        .collect();
-    for lc in lcs.iter_mut() {
-        let mut minted: crate::det::HashMap<String, Symbol> =
-            crate::det::HashMap::default();
-        // Source order of first use, so the emitted constants read down the
-        // file in the order the template reaches them.
-        let mut order: Vec<(Symbol, Expr)> = Vec::new();
-        for m in &mut lc.methods {
-            hoist_in_expr(&mut m.body, &mut minted, &mut order, &mut used);
-        }
-        lc.constants.extend(order);
-    }
-}
-
 /// Strip one trailing `.to_s` (the view walker's `coerce_to_s` wrap) so
 /// the safe-call check sees the helper call itself.
 fn strip_to_s(e: &Expr) -> &Expr {
@@ -4833,6 +4559,56 @@ fn bang_to_reassign(expr: &mut Expr) {
     }
 }
 
+/// ActiveSupport `String#pluralize` / `String#pluralize(count)`, inflection
+/// of the string ITSELF (singular when count == 1, else the plural),
+/// distinct from the count-labeling `Inflector.pluralize(count, word)`.
+/// Spinel can't reopen the built-in String, so the call lands on the
+/// ruby-family `Inflector.pluralize_word` module function. A value read
+/// out of `params` or an untyped Hash reaches here as untyped or nilable,
+/// so those receivers count too, unless the app defines a `pluralize` of
+/// its own that such a receiver could be dispatching to.
+fn ground_string_pluralize(expr: &mut Expr, app_defines_pluralize: bool) {
+    expr.node.for_each_child_mut(&mut |c| ground_string_pluralize(c, app_defines_pluralize));
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else { return };
+    if method.as_str() != "pluralize" || args.len() > 1 {
+        return;
+    }
+    let Some(ty) = r.ty.as_ref() else { return };
+    let string_receiver = matches!(ty, crate::ty::Ty::Str)
+        || (!app_defines_pluralize && pluralize_receiver_may_be_string(ty));
+    if !string_receiver {
+        return;
+    }
+    let span = expr.span;
+    let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
+    let ExprNode::Send { recv, args, .. } = node else { unreachable!() };
+    let count = args.into_iter().next().unwrap_or_else(|| Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
+    *expr.node = ExprNode::Send {
+        recv: Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Inflector")] })),
+        method: Symbol::from("pluralize_word"),
+        args: vec![recv.unwrap(), count],
+        block: None,
+        parenthesized: true,
+    };
+}
+
+/// A String or a value of no settled type, possibly nilable (a Hash read
+/// nests the nil). An element of a `params` list reads as a `ParamValue`,
+/// and a block over a list built from `permit(...).to_h` leaves its element
+/// an unresolved variable.
+fn pluralize_receiver_may_be_string(ty: &crate::ty::Ty) -> bool {
+    use crate::ty::Ty;
+    match ty {
+        Ty::Str | Ty::Untyped | Ty::Var { .. } => true,
+        Ty::Class { id, .. } => id.0.as_str() == "Roundhouse::ParamValue",
+        Ty::Union { variants } => {
+            variants.iter().any(|v| !matches!(v, Ty::Nil))
+                && variants.iter().all(|v| matches!(v, Ty::Nil) || pluralize_receiver_may_be_string(v))
+        }
+        _ => false,
+    }
+}
+
 fn rewrite_helper_calls(
     expr: &mut Expr,
     index: &HashMap<Symbol, ClassId>,
@@ -4875,36 +4651,6 @@ fn rewrite_helper_calls(
     {
         for statement in statements {
             bang_to_reassign(statement);
-        }
-    }
-
-    // ActiveSupport `String#pluralize(count)` — count-aware inflection of
-    // the string ITSELF (singular when count == 1, else the inflected
-    // plural), distinct from the count-labeling `Inflector.pluralize(count,
-    // word)` grounded below. Spinel can't reopen the built-in String, so
-    // lower the String-receiver form to the ruby-family `Inflector.
-    // pluralize_word` module function. String-typed receiver only, so a
-    // model's own one-arg `pluralize` (should one exist) is left alone.
-    if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node {
-        if method.as_str() == "pluralize"
-            && args.len() == 1
-            && matches!(r.ty, Some(crate::ty::Ty::Str))
-        {
-            let span = expr.span;
-            let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
-            let ExprNode::Send { recv, args, .. } = node else { unreachable!() };
-            let count = args.into_iter().next().unwrap();
-            *expr.node = ExprNode::Send {
-                recv: Some(Expr::new(
-                    span,
-                    ExprNode::Const { path: vec![Symbol::from("Inflector")] },
-                )),
-                method: Symbol::from("pluralize_word"),
-                args: vec![recv.unwrap(), count],
-                block: None,
-                parenthesized: true,
-            };
-            return;
         }
     }
 
@@ -6114,6 +5860,7 @@ pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
         .direct_helpers
         .iter()
         .map(|h| format!("{}_path", h.name.as_str()))
+        .chain(app.generated_route_helpers.iter().map(|m| m.name.as_str().to_string()))
         .collect();
     let class_method_targets = record_answering_class_methods(app);
     // The route helpers' OWN lowered signatures — read off the slice we
@@ -6619,7 +6366,16 @@ fn rewrite_route_params(expr: &mut Expr, sig: &RecordSignals<'_>) {
             // `to_s`. campfire's own test writes `user_sidebar_url(:me)`
             // against a `scope defaults: { user_id: "me" }` segment,
             // and that segment is declared `String` after its default.
-            if wants_str_here {
+            // An optional segment (`/media_proxy/:id/(*any)`, `String |
+            // nil`) the same: a Symbol is never nil.
+            let wants_str_or_nil_here = matches!(
+                declared.as_ref().and_then(|tys| tys.get(idx)),
+                Some(crate::ty::Ty::Union { variants })
+                    if variants.len() == 2
+                        && variants.contains(&crate::ty::Ty::Str)
+                        && variants.contains(&crate::ty::Ty::Nil)
+            );
+            if wants_str_here || wants_str_or_nil_here {
                 if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node {
                     let mut lit = Expr::new(
                         arg.span,
@@ -6645,30 +6401,44 @@ fn rewrite_route_params(expr: &mut Expr, sig: &RecordSignals<'_>) {
             // whatever the schema says (a new record's key, a reader the
             // model overrides), so the argument is bound once and only a
             // value that isn't nil is converted.
-            let wants_opt_str_here = matches!(
-                declared.as_ref().and_then(|tys| tys.get(idx)),
-                Some(crate::ty::Ty::Union { variants })
-                    if variants.len() == 2
-                        && variants.contains(&crate::ty::Ty::Str)
-                        && variants.contains(&crate::ty::Ty::Nil)
-            );
             // `Integer | nil` too (`flag ? n : nil`): the binding keeps the nil.
             let int_or_nil = matches!(&arg.ty, Some(crate::ty::Ty::Union { variants })
                 if variants.len() == 2
                     && variants.contains(&crate::ty::Ty::Int)
                     && variants.contains(&crate::ty::Ty::Nil));
-            if wants_opt_str_here
-                && (matches!(arg.ty, Some(crate::ty::Ty::Int)) || int_or_nil || is_integer_column_read(arg, sig))
+            // `Symbol | nil` (`flag ? :thumb : nil`) the same way: the
+            // Symbol is its String, the nil drops the segment (CodeRabbit
+            // on #2071). `Symbol | String | nil` and `Symbol | Integer | nil`
+            // too: a String's `to_s` is itself, an Integer's is its
+            // `to_param`.
+            let sym_union = |nil: bool| {
+                matches!(&arg.ty, Some(crate::ty::Ty::Union { variants })
+                    if variants.contains(&crate::ty::Ty::Sym)
+                        && variants.contains(&crate::ty::Ty::Nil) == nil
+                        && variants.iter().all(|v| matches!(v, crate::ty::Ty::Sym | crate::ty::Ty::Str | crate::ty::Ty::Int | crate::ty::Ty::Nil)))
+            };
+            let sym_or_nil = sym_union(true);
+            if wants_str_or_nil_here
+                && (matches!(arg.ty, Some(crate::ty::Ty::Int))
+                    || int_or_nil
+                    || sym_or_nil
+                    || is_integer_column_read(arg, sig))
             {
                 let value = std::mem::replace(arg, Expr::new(arg.span, ExprNode::Seq { exprs: vec![] }));
                 *arg = to_s_keeping_nil(value, sig);
                 continue;
             }
-            if wants_str_here
+            // A Symbol-typed value in an optional segment (`style =
+            // :thumb; media_proxy_path(id, style)`) is never nil, so it
+            // is its `to_s` there as well (CodeRabbit on #2071), as is a
+            // `Symbol | String` or `Symbol | Integer` one (`flag ? :thumb :
+            // "small"`).
+            if (wants_str_here
                 && (is_bare_id_read(arg)
                     || is_symbol_arg(arg)
                     || matches!(arg.ty, Some(crate::ty::Ty::Int))
-                    || is_integer_column_read(arg, sig))
+                    || is_integer_column_read(arg, sig)))
+                || (wants_str_or_nil_here && (is_symbol_arg(arg) || sym_union(false)))
             {
                 let span = arg.span;
                 let inner =
@@ -8048,8 +7818,14 @@ pub(crate) fn apply_constant_rooting(
             let segs: Vec<&str> = name.split("::").collect();
             (1..segs.len()).map(|i| segs[..i].join("::")).collect()
         };
+        // A parameter's default is evaluated in the method's lexical
+        // scope, as its body is: `def tag(value = Util.tag)` in a
+        // compact `class Gadget::Thing` reads `::Util`.
         for m in &mut lc.methods {
             root_shadowed_constants(&mut m.body, name, &shadowing, &prefixes, &known);
+            for default in m.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                root_shadowed_constants(default, name, &shadowing, &prefixes, &known);
+            }
         }
     }
 }
@@ -8557,6 +8333,24 @@ thread_local! {
     static RENDERED: std::cell::RefCell<Option<Vec<LibraryClass>>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Both per-reference indexes over `classes`, for a render on a worker
+/// thread (`par_render`), which starts with none installed.
+pub(super) fn install_worker_lookup_indexes<'a>(app: &'a App, classes: &'a [LibraryClass]) -> LookupIndexes<'a> {
+    install_lookup_indexes_for(app, classes)
+}
+
+/// Whether a lookup test has turned the indexes off on this thread.
+#[cfg(test)]
+pub(super) fn lookups_uncached() -> bool {
+    lookup_tests::UNCACHED.get()
+}
+
+/// Whether a [`record_rendered`] is collecting the classes rendered on
+/// this thread, which it lists in render order.
+pub(super) fn recording_rendered() -> bool {
+    RENDERED.with(|r| r.borrow().is_some())
+}
+
 pub fn record_rendered<T>(f: impl FnOnce() -> T) -> (T, Vec<LibraryClass>) {
     let previous = RENDERED.with(|r| r.borrow_mut().replace(Vec::new()));
     let out = f();
@@ -8770,7 +8564,7 @@ fn emit_library_class_decl_inner(
         && (lc.has_source_ivar_initializers() || !replayed_in_place.is_empty())
         && !app.controllers.iter().any(|controller| controller.name == lc.name);
     let (mut eager, mut deferred, initializers_call_self) = partition_deferred_constants(lc);
-    let load_time_bodies = initializers_call_self || !deferred.is_empty();
+    let load_time_bodies = !deferred.is_empty();
     if ordered_body {
         eager = (0..lc.constants.len()).collect();
         deferred.clear();
@@ -8829,6 +8623,19 @@ fn emit_library_class_decl_inner(
         let rel = relpath(&out_dir, anchor);
         if !requires.contains(&rel) {
             requires.push(rel);
+        }
+        // So is every segment between the runtime's and this one (rack-protection's `Rack::Protection` around
+        // `class Rack::Protection::Base`): the compound header looks it up too.
+        for end in 2..outer_segments.len() {
+            let path: Vec<String> = outer_segments[..end].iter().map(|s| s.to_string()).collect();
+            let Some(inner) = require_path_for_body_const(&path, app, classes, "") else { continue };
+            if inner == self_anchor || inner.starts_with("runtime/") || inner.starts_with(&format!("{self_anchor}/")) {
+                continue;
+            }
+            let rel = relpath(&out_dir, &inner);
+            if !requires.contains(&rel) {
+                requires.push(rel);
+            }
         }
     }
     // `include`d modules must be LOADED before the `include` executes at
@@ -9028,6 +8835,14 @@ fn emit_library_class_decl_inner(
     for &i in &deferred {
         body_requires.extend(resolve_all(&lc.constants[i].1, true));
     }
+    // Not every method body at load: only what an initializer reaches, or a body-only edge closes a cycle (devise.rb, url_helpers.rb).
+    if initializers_call_self {
+        for init in &lc.class_ivar_initializers {
+            let mut paths = BTreeSet::new();
+            walk_load_time_paths(init, lc, &mut BTreeSet::new(), &mut paths);
+            body_requires.extend(paths.iter().filter_map(|p| resolve(p, true)));
+        }
+    }
     // Not only the interleaved ones, which the split plan places: an ordered body writes the rest after its methods, where they read their constants as the body loads (devise's `@@helpers << Devise::Controllers::Helpers`).
     if ordered_body {
         for init in lc.class_ivar_initializers.iter().filter(|init| {
@@ -9038,6 +8853,31 @@ fn emit_library_class_decl_inner(
             body_requires.extend(paths.iter().filter_map(|p| resolve(p, true)));
         }
     }
+    // A subclass's file requires this one as it loads (its superclass): a method body naming the subclass
+    // (ApplicationController's `devise_controller?`, `is_a?(::DeviseController)`) requires it after the class, where
+    // the cycle finds this class defined.
+    let parents: HashMap<&str, &str> = classes
+        .iter()
+        .filter_map(|c| c.parent.as_ref().map(|p| (c.name.0.as_str(), p.0.as_str().trim_start_matches("::"))))
+        .chain(app.controllers.iter().filter_map(|c| c.parent.as_ref().map(|p| (c.name.0.as_str(), p.0.as_str().trim_start_matches("::")))))
+        .collect();
+    let descends = |class: &str| {
+        let mut cur = parents.get(class).copied();
+        for _ in 0..32 {
+            match cur {
+                Some(p) if p == name => return true,
+                Some(p) => cur = parents.get(p).copied(),
+                None => return false,
+            }
+        }
+        false
+    };
+    let subclass_requires: BTreeSet<String> = parents
+        .keys()
+        .filter(|class| **class != name && descends(class))
+        .filter_map(|class| resolve(&class.split("::").map(str::to_string).collect(), false))
+        .collect();
+    let mut tail_requires: BTreeSet<String> = BTreeSet::new();
     let factory_methods: Vec<&MethodDef> = lc
         .constants
         .iter()
@@ -9056,7 +8896,13 @@ fn emit_library_class_decl_inner(
             walk_load_time_paths_on(&m.body, lc, m.receiver, &mut BTreeSet::new(), &mut paths);
             body_requires.extend(paths.iter().filter_map(|p| resolve(p, true)));
         } else {
-            body_requires.extend(resolve_all(&m.body, false));
+            for r in resolve_all(&m.body, false) {
+                if subclass_requires.contains(&r) {
+                    tail_requires.insert(r);
+                } else {
+                    body_requires.insert(r);
+                }
+            }
         }
     }
     for m in factory_methods {
@@ -9126,6 +8972,7 @@ fn emit_library_class_decl_inner(
     }
     body_requires.retain(|r| !requires.contains(r));
     requires.extend(body_requires);
+    tail_requires.retain(|r| !requires.contains(r));
     for r in &requires {
         writeln!(s, "require_relative {r:?}").unwrap();
     }
@@ -9420,7 +9267,7 @@ fn emit_library_class_decl_inner(
         if render_conditional(s, m) {
             return;
         }
-        if data_block {
+        if lc.data_define().is_some_and(|(_, span)| m.name_span.file == span.file && m.name_span.start >= span.start && m.name_span.end <= span.end) {
             let mut m = m.clone();
             m.body = top_level(&m.body);
             for param in m.params.iter_mut().chain(m.block_param.iter_mut()) {
@@ -9639,6 +9486,12 @@ fn emit_library_class_decl_inner(
 
     for i in (0..depth).rev() {
         writeln!(s, "{}end", "  ".repeat(i)).unwrap();
+    }
+    if !tail_requires.is_empty() {
+        writeln!(s).unwrap();
+        for r in &tail_requires {
+            writeln!(s, "require_relative {r:?}").unwrap();
+        }
     }
 
     EmittedFile { path: out_path, content: s }
@@ -9990,6 +9843,9 @@ struct NameIndex {
     first_modules_bare: std::cell::OnceCell<HashMap<String, usize>>,
     constant_paths: std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<String>>>,
     file_constant_owners: std::cell::OnceCell<HashMap<String, String>>,
+    /// How each declared signature spelled its class names
+    /// (`app.rbs_spellings`), by `Owner#method`, for `rbs::type_name`.
+    written: HashMap<String, crate::rbs::Spellings>,
     source_ptr: usize,
     source_len: usize,
 }
@@ -10033,6 +9889,7 @@ impl NameIndex {
             first_modules_bare: std::cell::OnceCell::new(),
             constant_paths: std::cell::OnceCell::new(),
             file_constant_owners: std::cell::OnceCell::new(),
+            written: declared_spellings(app),
             source_ptr: classes.as_ptr() as usize,
             source_len: classes.len(),
         };
@@ -10643,6 +10500,31 @@ fn app_constant_paths(app: &App, classes: &[LibraryClass]) -> std::rc::Rc<crate:
         Some(index) => index.constant_paths.get_or_init(build).clone(),
         None => build(),
     }
+}
+
+/// How each declared method (`app.rbs_signatures`) spelled its class
+/// names, by `Owner#method`; empty where its reader recorded none.
+fn declared_spellings(app: &App) -> HashMap<String, crate::rbs::Spellings> {
+    let methods = app.rbs_signatures.iter().flat_map(|(owner, methods)| methods.keys().map(move |m| (owner, m)));
+    methods.map(|(owner, m)| {
+        let spelled = app.rbs_spellings.get(owner).and_then(|s| s.get(m)).cloned().unwrap_or_default();
+        (format!("{}#{}", owner.0.as_str(), m.as_str()), spelled)
+    }).collect()
+}
+
+/// For an RBS sidecar: how `owner`'s declared signature of `method`
+/// spelled its class names, from the installed index.
+pub(super) fn written_names(owner: &str, method: &str) -> Option<crate::rbs::Spellings> {
+    NAME_INDEX.with(|slot| slot.borrow().as_ref().and_then(|(_, index)| index.written.get(&format!("{owner}#{method}")).cloned()))
+}
+
+/// For an RBS sidecar: whether `path` is a model, controller or library
+/// class or module, the classes analysis resolves a written name against
+/// (`analyze::body::lexical_class`). False with no index installed.
+pub(super) fn registers(path: &str) -> bool {
+    NAME_INDEX.with(|slot| slot.borrow().as_ref().is_some_and(|(_, index)| {
+        index.models.contains(path) || index.controllers.contains(path) || index.library_classes.contains_key(path)
+    }))
 }
 
 /// Does the app declare the constant `path`, or a namespace enclosing a
@@ -11357,6 +11239,8 @@ pub(crate) fn apply_boolean_lowering(lcs: &mut [LibraryClass], app: &App) {
 /// alone, as is the primary key's.
 pub(crate) fn apply_typed_writer_cast_lowering(lcs: &mut [LibraryClass], app: &App) {
     apply_enum_raw_input_lowering(lcs, app);
+    apply_string_keyed_attrs_lowering(lcs, app);
+    apply_dynamic_human_attribute_name(lcs, app);
     for model in &app.models {
         let table = app.schema.tables.get(&model.table.0);
         let mut casts: HashMap<Symbol, &'static str> = table
@@ -11427,8 +11311,19 @@ pub(crate) fn apply_typed_writer_cast_lowering(lcs: &mut [LibraryClass], app: &A
         // Columns only: an ActiveModel attribute has no `_before_type_cast`,
         // so its check reads the cast value (`"abc"` is 0, Rails 8.1.4).
         checked.retain(|c| casts.contains_key(c) && table.is_some_and(|t| t.columns.iter().any(|col| col.name == *c)));
+        // A column held unset until assigned has a method writer over its
+        // `@<col>_raw` slot (`validations::hold_unset_presence_columns`).
+        let held: Vec<Symbol> = crate::lower::validations::held_unset_columns(&app.models, &app.schema)
+            .into_iter()
+            .filter(|(class, _)| *class == model.name)
+            .map(|(_, col)| col)
+            .collect();
+        let held_writer = |m: &crate::dialect::MethodDef| {
+            m.kind == crate::dialect::AccessorKind::Method
+                && m.name.as_str().strip_suffix('=').is_some_and(|c| held.iter().any(|h| h.as_str() == c))
+        };
         for m in &mut lc.methods {
-            if m.receiver != MethodReceiver::Instance || m.kind != crate::dialect::AccessorKind::AttributeWriter {
+            if m.receiver != MethodReceiver::Instance || (m.kind != crate::dialect::AccessorKind::AttributeWriter && !held_writer(m)) {
                 if !checked.is_empty() {
                     read_raw_in_numericality_checks(&mut m.body, &checked);
                     forget_raw_on_internal_writes(&mut m.body, &checked);
@@ -11456,7 +11351,7 @@ pub(crate) fn apply_typed_writer_cast_lowering(lcs: &mut [LibraryClass], app: &A
             let ExprNode::Assign { target: crate::expr::LValue::Ivar { name: ivar }, value } = assign else {
                 continue;
             };
-            if *ivar != col {
+            if *ivar != col && !(held.contains(&col) && ivar.as_str() == format!("{}_raw", col.as_str())) {
                 continue;
             }
             cast_param_reads(value, &param, cast);
@@ -11475,6 +11370,88 @@ pub(crate) fn apply_typed_writer_cast_lowering(lcs: &mut [LibraryClass], app: &A
 /// `<enum>_before_type_cast` answers what was assigned until the record
 /// saves or loads, and the stored value after (activerecord 8.1.4). Only
 /// for the enum columns the app reads it on.
+/// Ruby-family pre-emit pass: `Model.new(attrs)` reads `attrs[:col]`, and Rails' `new` takes a String-keyed Hash as
+/// well (`assign_attributes` stringifies the keys): Devise's `resource_class.new(sign_in_params)` hands one. Strict
+/// targets type the parameter as Symbol-keyed and are not rewritten.
+fn apply_string_keyed_attrs_lowering(lcs: &mut [LibraryClass], app: &App) {
+    let var = |name: &str| sp_expr(ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from(name) });
+    let send = |recv: Expr, method: &str, args: Vec<Expr>, block: Option<Expr>| {
+        sp_expr(ExprNode::Send { recv: Some(recv), method: Symbol::from(method), args, block, parenthesized: true })
+    };
+    let block = |params: &[&str], body: Expr| {
+        sp_expr(ExprNode::Lambda {
+            params: params.iter().map(|p| Symbol::from(*p)).collect(),
+            rest_param: None,
+            extra_params: Vec::new(),
+            block_param: None,
+            body,
+            block_style: crate::expr::BlockStyle::Brace,
+        })
+    };
+    for model in &app.models {
+        let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
+        // Not `initialize` alone: `update(attrs)` reads the same Symbol keys (Devise's `update_with_password(params)`).
+        // Only the generated `update`: one the model writes takes its arguments as it reads them.
+        for init in lc.methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance && (m.name.as_str() == "initialize" || (m.name.as_str() == "update" && m.name_span.is_synthetic()))) {
+        if init.params.first().is_none_or(|p| p.name.as_str() != "attrs") {
+            continue;
+        }
+        // Not a runtime helper: a tree that loads its models without the boot (a framework test) has none, and this
+        // reads nothing of a typed params object, nor allocates for the empty Hash a bare record is built from.
+        // `attrs = attrs.to_h { |k, v| [k.to_s.to_sym, v] } if attrs.is_a?(Hash) && attrs.any? { |k, _| k.is_a?(String) }`
+        let string_key = send(var("k"), "is_a?", vec![sp_expr(ExprNode::Const { path: vec![Symbol::from("String")] })], None);
+        let cond = sp_expr(ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::And,
+            surface: crate::expr::BoolOpSurface::Symbol,
+            left: send(var("attrs"), "is_a?", vec![sp_expr(ExprNode::Const { path: vec![Symbol::from("Hash")] })], None),
+            right: send(var("attrs"), "any?", Vec::new(), Some(block(&["k", "_"], string_key))),
+        });
+        let pair = sp_expr(ExprNode::Array {
+            elements: vec![send(send(var("k"), "to_s", Vec::new(), None), "to_sym", Vec::new(), None), var("v")],
+            style: Default::default(),
+        });
+        let symbolized = send(var("attrs"), "to_h", Vec::new(), Some(block(&["k", "v"], pair)));
+        let assign = sp_expr(ExprNode::Assign { target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: Symbol::from("attrs") }, value: symbolized });
+        let guarded = sp_expr(ExprNode::If { cond, then_branch: assign, else_branch: sp_expr(ExprNode::Lit { value: Literal::Nil }) });
+        let body = std::mem::replace(&mut init.body, sp_expr(ExprNode::Lit { value: Literal::Nil }));
+        init.body = match *body.node {
+            ExprNode::Seq { mut exprs } => {
+                exprs.insert(0, guarded);
+                sp_expr(ExprNode::Seq { exprs })
+            }
+            other => sp_expr(ExprNode::Seq { exprs: vec![guarded, Expr::new(body.span, other)] }),
+        };
+        }
+    }
+}
+
+/// Ruby-family pre-emit pass: `Model.human_attribute_name(attr)` of an attribute only known when it runs (Devise's
+/// `scope_class.human_attribute_name(key)`) answers the locale's name for it, as Rails does. `lower::
+/// human_attribute_name` folds a literal attribute; the runtime's ActiveRecord::Base answer humanizes, which is
+/// Rails' too where the locale names no attribute, so only a model whose locale names one gets its own.
+fn apply_dynamic_human_attribute_name(lcs: &mut [LibraryClass], app: &App) {
+    for model in &app.models {
+        let names = model.i18n.translated_attribute_names();
+        if names.is_empty() {
+            continue;
+        }
+        let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
+        if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "human_attribute_name") {
+            continue;
+        }
+        let arms: String = names.iter().map(|(attr, name)| format!("    when {attr:?} then {name:?}\n")).collect();
+        let src = format!(
+            "def self.human_attribute_name(attr, options = {{}})\n  case attr.to_s\n{arms}  else ActiveSupport.humanize(attr.to_s.tr(\".\", \"_\"))\n  end\nend\n"
+        );
+        let Ok(mut methods) = crate::runtime_src::parse_methods(&src) else { continue };
+        for m in &mut methods {
+            m.receiver = MethodReceiver::Class;
+            m.enclosing_class = Some(model.name.0.clone());
+        }
+        lc.methods.extend(methods);
+    }
+}
+
 fn apply_enum_raw_input_lowering(lcs: &mut [LibraryClass], app: &App) {
     let demanded = crate::analyze::raw_input_columns(app);
     if demanded.is_empty() {

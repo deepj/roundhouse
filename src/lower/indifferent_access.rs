@@ -6,6 +6,11 @@ use crate::span::Span;
 use crate::ty::Ty;
 
 pub fn apply_indifferent_access_lowering(app: &mut App) {
+    for method in app.library_classes.iter_mut().flat_map(|c| c.methods.iter_mut()).chain(app.models.iter_mut().flat_map(|m| m.methods_mut())) {
+        keyed_like_indifferent(method);
+    }
+    let app_defines = app_defines_conversion(app);
+    let mut lower = |body: &mut Expr| lower(body, app_defines);
     super::for_each_hook_body(app, &mut lower);
     for view in &mut app.views {
         lower(&mut view.body);
@@ -13,15 +18,34 @@ pub fn apply_indifferent_access_lowering(app: &mut App) {
     super::for_each_test_body(app, &mut lower);
 }
 
-fn lower(body: &mut Expr) {
-    rewrite(body);
+fn app_defines_conversion(app: &App) -> bool {
+    let conversion = |name: &str| name == "with_indifferent_access";
+    app.models.iter().any(|m| m.methods().any(|d| conversion(d.name.as_str())))
+        || app.library_classes.iter().any(|c| c.methods.iter().any(|d| conversion(d.name.as_str())))
+}
+
+fn lower(body: &mut Expr, app_defines: bool) {
+    rewrite(body, app_defines);
     // Not retyped during the rewrite: a parent call finds its indifferent receiver by the type its child still carries.
     retype(body);
 }
 
-fn rewrite(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite);
+fn rewrite(expr: &mut Expr, app_defines: bool) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, app_defines));
     if !expr.ty.as_ref().is_some_and(|t| !matches!(t, Ty::Var { .. })) {
+        // A receiver analysis could not type: a jbuilder partial's local
+        // is one, as no `render` call binds it. Only a Hash's conversion
+        // can be meant unless the app defines the name itself.
+        if !app_defines
+            && let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node
+            && method.as_str() == "with_indifferent_access"
+            && args.is_empty()
+            && recv.ty.as_ref().is_none_or(|t| matches!(t, Ty::Var { .. }))
+        {
+            let mut call = support_call(expr.span, "indifferent", vec![recv.clone()]);
+            call.ty = indifferent::from_gradual(&Ty::Untyped);
+            *expr = call;
+        }
         return;
     }
     // An untyped receiver (a json column's reader, `extras || {}`) is the
@@ -255,4 +279,36 @@ fn retype(expr: &mut Expr) {
     if let Some(ty) = expr.ty.as_ref().filter(|t| indifferent::mentions(t)) {
         expr.ty = Some(indifferent::plain(ty));
     }
+}
+
+/// A parameter both a Symbol-keyed Hash and an indifferent one reach (Devise's `ParameterFilter#filter`, passed
+/// `{ confirmation_token: t }` and a request's params): the body's reads and writes are lowered to String keys, so a
+/// Symbol-keyed one is converted as the method is entered.
+// Not the arguments at each call: a call outside the analyzed bodies (a gem's, a test's) would pass its Hash unconverted.
+fn keyed_like_indifferent(method: &mut crate::dialect::MethodDef) {
+    let Some(Ty::Fn { params, .. }) = &method.signature else { return };
+    let mixed = |ty: &Ty| {
+        let leaves = leaves(ty);
+        leaves.iter().any(|v| matches!(v, Ty::Hash { key, .. } if matches!(**key, Ty::Sym)))
+            && leaves.iter().any(|v| indifferent::value_of(v).is_some())
+    };
+    let names: Vec<Symbol> = params
+        .iter()
+        .filter(|p| matches!(p.kind, crate::ty::ParamKind::Required | crate::ty::ParamKind::Optional) && mixed(&p.ty))
+        .map(|p| p.name.clone())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    let span = method.body.span;
+    let mut exprs: Vec<Expr> = Vec::new();
+    for name in names {
+        let id = crate::ident::VarId(0);
+        let read = Expr::new(span, ExprNode::Var { id, name: name.clone() });
+        let converted = support_call(span, "indifferent_param", vec![read]);
+        exprs.push(Expr::new(span, ExprNode::Assign { target: crate::expr::LValue::Var { id, name }, value: converted }));
+    }
+    let body = std::mem::replace(&mut method.body, Expr::new(span, ExprNode::Seq { exprs: Vec::new() }));
+    exprs.push(body);
+    method.body = Expr::new(span, ExprNode::Seq { exprs });
 }

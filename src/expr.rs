@@ -175,6 +175,10 @@ pub const SINGLETON_CONSTANT_REF: u64 = 1 << 29;
 /// The mark stays when lowering spells `Pathname(x)` as `Pathname.new(x)`.
 pub const KERNEL_CONVERSION: u64 = 1 << 30;
 
+/// Analysis dispatched this receiverless Kernel-named send (`puts`, `load`, …)
+/// to its own class's method on that side: no target maps it to a builtin.
+pub const APP_KERNEL_NAME: u64 = 1 << 59;
+
 /// On the body of a method `ingest::inherited_alias::resolve` copied
 /// from an ancestor for an `alias` of it: the Ruby family writes the
 /// captured `alias_method` back instead, and drops the copy.
@@ -205,6 +209,8 @@ pub const GUARDED_NAME_ERROR: u64 = 1 << 55;
 pub const UNCALLED_DEFINER: u64 = 1 << 56;
 /// An integer literal wider than 64 bits, built from 32-bit limbs: the ruby family's Integer holds it, a fixed-width one does not.
 pub const WIDE_INTEGER_LITERAL: u64 = 1 << 57;
+/// On `x ||= v` where analyze typed the local `x` as never nil nor false: Ruby never assigns, so `v` is dead.
+pub const DEAD_OR_ASSIGN: u64 = 1 << 58;
 
 /// On a route-helper call `lower::route_format_suffix` renamed for its
 /// literal `format:` (`widget_url(w, format: :json)` to

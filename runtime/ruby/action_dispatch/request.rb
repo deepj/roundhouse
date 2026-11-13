@@ -131,6 +131,8 @@ module ActionDispatch
     # `host` is a method: it answers `raw_host_with_port`, while `@host`
     # stays the Host header the dispatcher stored.
     attr_accessor :env
+    # Rails' `request.flash`: the flash the controller serving this request holds (Devise asks `request.respond_to?(:flash)`).
+    attr_accessor :flash
     # Rails' `request_parameters`: the BODY's params alone, without the
     # query string or the path captures. ParamsWrapper copies from these
     # (`Params.wrap`); the dispatcher fills them.
@@ -143,6 +145,7 @@ module ActionDispatch
     attr_accessor :query_parameters
 
     def initialize
+      @flash = nil
       @remote_ip = "127.0.0.1"
       @path = "/"
       @query_string = +""
@@ -225,6 +228,12 @@ module ActionDispatch
       @session = value
     end
 
+    # Rails' `Request#reset_session` (Warden's `reset_session!` on sign-out): the session emptied in place, so what
+    # holds it sees it empty too.
+    def reset_session
+      session.clear
+    end
+
     # Whether the dispatcher should leave the session cookie alone this
     # response (Rails: the session middleware skips its commit).
     def session_skip?
@@ -279,6 +288,25 @@ module ActionDispatch
       @path_parameters = RequestPathParameters.new(values)
     end
 
+    # Rails' `Request.new(env)`: a wrapper over the env, whose state is the request's, so the request the routes
+    # serve for this env (`roundhouse.request`), or a new one where none is.
+    def self.for_env(env)
+      found = env["roundhouse.request"]
+      return found if found.is_a?(ActionDispatch::Request)
+      # Not a request of its own env: what it is asked for and writes (its cookie jar) is the env's, as Rails' is.
+      request = ActionDispatch::Request.new
+      request.env = env
+      # The session the dispatcher restored into the env, so a reset here is the one it persists.
+      restored = env["rack.session"]
+      request.session = restored if restored.is_a?(ActionDispatch::Session)
+      request
+    end
+
+    # Rails' HTTP_METHOD_LOOKUP: the verb as a Symbol, `M-SEARCH` as `:m_search`.
+    def request_method_symbol
+      @request_method.downcase.tr("-", "_").to_sym
+    end
+
     def get?
       @request_method == "GET"
     end
@@ -289,6 +317,10 @@ module ActionDispatch
 
     def put?
       @request_method == "PUT"
+    end
+
+    def patch?
+      @request_method == "PATCH"
     end
 
     # `head?` sits beside `get?` because Rails' "is this a safe

@@ -37,6 +37,18 @@ module ActionDispatch
     # runtime/ruby/action_dispatch/request.rb.
     attr_accessor :request_parameters
     attr_reader :path_parameters
+    # Rails' `request.flash`, the flash of the controller serving this request — see the twin in
+    # runtime/ruby/action_dispatch/request.rb.
+    attr_accessor :flash
+
+    # Rails' `Request.new(env)`, a wrapper over the env whose state is the request's: the one the routes serve for
+    # this env (Warden's `request`, which Devise's strategies read the params of), else one over the env's params.
+    def self.for_env(env)
+      found = env["roundhouse.request"]
+      return found if found.is_a?(ActionDispatch::Request)
+      parsed = env["roundhouse.parsed_request"]
+      new(env, parsed.nil? ? {} : parsed[:params])
+    end
 
     def initialize(env, params = {})
       @env = env
@@ -64,6 +76,11 @@ module ActionDispatch
 
     def session=(value)
       @env["rack.session"] = value
+    end
+
+    # Rails' `Request#reset_session`, as the twin's.
+    def reset_session
+      session.clear
     end
 
     # `request.headers["Accept-Encoding"]` — the shared
@@ -119,6 +136,7 @@ module ActionDispatch
     # `"put"` must stay false). Shared `runtime/ruby` `put?` is likewise
     # case-sensitive on `@request_method` (no upcase on assign).
     def put? = @env["REQUEST_METHOD"] == "PUT"
+    def patch? = @env["REQUEST_METHOD"] == "PATCH"
     # Rails' "is this a safe request" idiom is `request.get? ||
     # request.head?`, and campfire writes exactly that in
     # `BlockBannedRequests#safe_request?`. This overlay is the Request
@@ -365,6 +383,13 @@ module ActionDispatch
 
     def inertia?
       !@env["HTTP_X_INERTIA"].to_s.empty?
+    end
+
+    # Rails' `parameters`: every param the request carries, by a String or a Symbol, the same Hash `params` answers
+    # from then on, so a write through either is seen by both.
+    def parameters
+      @params = @params.with_indifferent_access unless @params.is_a?(ActiveSupport::HashWithIndifferentAccess)
+      @params
     end
 
     # Query-string params only (Rails' GET-vs-POST split); lobsters'

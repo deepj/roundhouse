@@ -58,15 +58,51 @@ fn attribute_macro_refusals(app: &App) -> Vec<Diagnostic> {
 /// each such call is refused here — as is an expanded field given an
 /// option its Rails `render` rewrites and the lowering would pass
 /// through as a plain attribute.
+fn descends_from_form_builder(app: &App, id: &crate::ident::ClassId) -> bool {
+    let mut current = id.clone();
+    for _ in 0..32 {
+        let Some(parent) = app.library_classes.iter().filter(|c| c.name == current).find_map(|c| c.parent.clone()) else { return false };
+        if parent.0.as_str().trim_start_matches("::") == "ActionView::Helpers::FormBuilder" {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 fn unlowered_form_builder_calls(app: &App) -> Vec<Diagnostic> {
     fn visit(app: &App, expr: &Expr, out: &mut Vec<Diagnostic>) {
+        // A builder class of the app's or a gem's own (`builder: MoneyFormBuilder`): a method the lowering does not
+        // expand runs on Rails' builder at request time, which the Ruby family's overlay carries and no other tree.
+        if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node
+            && !expr.span.is_synthetic()
+            && let Some(Ty::Class { id, .. }) = &r.ty
+            && id.0.as_str() != "ActionView::Helpers::FormBuilder"
+            && descends_from_form_builder(app, id)
+            && method.as_str() != "object"
+            && crate::lower::classify_form_builder_method(method.as_str()).is_none()
+        {
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "custom form builder method",
+                format!("`form.{}` is {}'s own method, which runs on Rails' FormBuilder at request time, carried by the Ruby family's runtime only", method.as_str(), id.0.as_str()),
+            ));
+        }
         if let ExprNode::Send { recv: Some(r), method, args, .. } = &*expr.node
             && !expr.span.is_synthetic()
-            && matches!(&r.ty, Some(Ty::Class { id, .. }) if id.0.as_str() == "ActionView::Helpers::FormBuilder")
+            && let Some(Ty::Class { id, .. }) = &r.ty
+            // A builder subclass's stock fields are expanded as the base's; its own methods are reported above.
+            && (id.0.as_str() == "ActionView::Helpers::FormBuilder" || descends_from_form_builder(app, id))
             && !FORM_BUILDER_HANDLED_ELSEWHERE.contains(&method.as_str())
         {
+            let base = id.0.as_str() == "ActionView::Helpers::FormBuilder";
             let m = method.as_str();
             if crate::lower::classify_form_builder_method(m).is_none() {
+                if !base {
+                    expr.node.for_each_child(&mut |child| visit(app, child, out));
+                    return;
+                }
                 out.push(Diagnostic::unsupported(
                     expr.span,
                     None,
@@ -811,10 +847,9 @@ fn diagnose_controller_output_collisions(app: &App, out: &mut Vec<Diagnostic>) {
     }
 }
 
-/// [`diagnose`] plus the missing-preload coverage triple, for report
-/// skins that state the denominator (#64: "0 findings" must be
-/// distinguishable from "couldn't check").
-pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
+/// What [`diagnose_with_coverage`] collects before the forwarding, private-call,
+/// filter-target and preload passes: the diagnostics in the order they are reported.
+fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     let mut out = app.routes.diagnostics.clone();
     diagnose_controller_output_collisions(app, &mut out);
     // A `default_url_options` whose path segments the route helpers do not take.
@@ -834,6 +869,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // A support file the class ingest left out, at what failed it.
     out.extend(app.ingest_drops.iter().map(|drop| Diagnostic::ingest_unsupported(drop.span, drop.message.clone())));
     out.extend(conditional_declarations_reopened(app));
+    out.extend(unsettled_conditional_writes(app));
     // Constructor refusals must also reach executable class constants and
     // parameter defaults, which the ordinary method diagnostic policy omits.
     fn collect_storage_constructors(expr: &Expr, out: &mut Vec<Diagnostic>) {
@@ -993,14 +1029,36 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     for stmt in &app.boot_program {
         diagnose_expr(stmt, &mut out);
     }
-    out.extend(super::forwarding::diagnose(app));
-    out.extend(super::private_calls::diagnose(app));
-    out.extend(super::filter_targets::diagnose(app));
+    out
+}
 
-    // Static N+1 pass (#64): missing-preload warnings over the typed
-    // query chains, same-procedure and through the controller→view
-    // ivar channel.
-    let (preload_diags, coverage) = preload::missing_preload_report(app);
+/// [`diagnose`] plus the missing-preload coverage triple, for report
+/// skins that state the denominator (#64: "0 findings" must be
+/// distinguishable from "couldn't check").
+pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
+    // The passes after the head read the app alone, as the head does, so they run beside it
+    // and their findings follow the head's, in this order.
+    let (mut out, (forwarding, (private_calls, filter_targets), (preload_diags, coverage))) = super::parallel::join(
+        || diagnose_head(app),
+        || {
+            let (forwarding, (private_calls_and_filters, preload)) = super::parallel::join(
+                || super::forwarding::diagnose(app),
+                || {
+                    super::parallel::join(
+                        || (super::private_calls::diagnose(app), super::filter_targets::diagnose(app)),
+                        // Static N+1 pass (#64): missing-preload warnings over the typed
+                        // query chains, same-procedure and through the controller→view
+                        // ivar channel.
+                        || preload::missing_preload_report(app),
+                    )
+                },
+            );
+            (forwarding, private_calls_and_filters, preload)
+        },
+    );
+    out.extend(forwarding);
+    out.extend(private_calls);
+    out.extend(filter_targets);
     out.extend(preload_diags);
     unshipped_gem_helpers(app, &mut out);
     let refused_gem_sites: crate::det::HashSet<_> = out.iter().filter_map(|diagnostic| {
@@ -1187,7 +1245,7 @@ fn gradual(ty: Option<&Ty>) -> bool {
     }
 }
 
-fn is_unknown_ty(ty: Option<&Ty>) -> bool {
+pub(crate) fn is_unknown_ty(ty: Option<&Ty>) -> bool {
     match ty {
         None => true,
         Some(Ty::Var { .. }) => true,
@@ -1244,7 +1302,7 @@ pub struct UnknownReceiverSend {
 /// True when `method` is registered on the receiver's class (either
 /// side), walking parents and includes. A registered method that returns
 /// `Ty::Var` still counts as resolved for the unknown-receiver ledger.
-fn method_registered_on(
+pub(crate) fn method_registered_on(
     classes: &HashMap<ClassId, ClassInfo>,
     ty: Option<&Ty>,
     method: &Symbol,
@@ -1751,6 +1809,36 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
         | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
     }
+}
+
+/// A write through the class's own writer in a load-time conditional whose
+/// branch is not settled at compile time: the emitted conditional selects
+/// methods only, so the write would run in no branch.
+fn unsettled_conditional_writes(app: &App) -> Vec<Diagnostic> {
+    fn writes<'a>(conditional: &'a crate::dialect::ConditionalDefinitions, out: &mut Vec<&'a Expr>) {
+        for arm in &conditional.arms {
+            out.extend(arm.statements.iter());
+            for nested in &arm.nested {
+                writes(nested, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for lc in &app.library_classes {
+        for conditional in &lc.conditional_definitions {
+            let mut found = Vec::new();
+            writes(conditional, &mut found);
+            for write in found {
+                out.push(Diagnostic::unsupported(
+                    write.span,
+                    None,
+                    "load-time conditional",
+                    "a class setting written in a load-time conditional whose branch is not known when compiling is not modeled".to_string(),
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// A class or module declared in a load-time conditional that another

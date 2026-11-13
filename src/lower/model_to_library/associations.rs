@@ -213,12 +213,19 @@ fn refuse_scoped_through_source(
     true
 }
 
+/// Whether `foreign_key` is a column held unset for its presence check
+/// (`validations::hold_unset_presence_columns`).
+fn held_key(table: Option<&crate::schema::Table>, foreign_key: &Symbol) -> bool {
+    table.is_some_and(|t| t.columns.iter().any(|c| c.name == *foreign_key && c.unset_until_assigned))
+}
+
 pub(super) fn push_association_methods(
     methods: &mut Vec<MethodDef>,
     model: &Model,
     models: &[Model],
     through_joins: &ThroughJoins,
     runtime_relation: super::RuntimeRelation,
+    table: Option<&crate::schema::Table>,
 ) {
     // The ruby family's belongs_to writer stores nil for a nil value, as
     // Rails does. A strict target's key field is its column's non-nil
@@ -460,6 +467,7 @@ pub(super) fn push_association_methods(
                         &assoc_pk,
                         sentinel,
                         keeps_nil,
+                        held_key(table, foreign_key),
                     ));
                 }
             }
@@ -505,7 +513,10 @@ pub(super) fn push_association_methods(
                         .iter()
                         .any(|m| m.name == writer_name && m.receiver == MethodReceiver::Instance)
                 {
-                    methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, &assoc_pk, sentinel, keeps_nil));
+                    // A key held unset for its presence check has a nilable
+                    // slot on every target, so nil unsets it there too.
+                    let held = held_key(table, foreign_key);
+                    methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, &assoc_pk, sentinel, keeps_nil || held));
                 }
                 push_singular_loaded_reader(methods, model, owner, name);
             }
@@ -582,58 +593,85 @@ pub(super) fn push_association_methods(
 }
 
 /// `def self._association_names; [:room, :creator, …]; end` — the name
-/// table `ActiveRecord::Base.reflect_on_association` consults. Values
-/// are association names only; `counter_cache:` is unmodeled, so the
-/// reflection always answers `counter_cache_column == nil` (campfire's
-/// `Message.reflect_on_association(:room)` assertion).
+/// table `ActiveRecord::Base.reflect_on_association` consults — and, in
+/// its order, each association's macro, foreign key and `polymorphic:`
+/// (orm_adapter's `belongs_to?` / `foreign_key`). `counter_cache:` is
+/// unmodeled, so the reflection always answers `counter_cache_column ==
+/// nil` (campfire's `Message.reflect_on_association(:room)` assertion).
 fn push_association_names(methods: &mut Vec<MethodDef>, model: &Model) {
-    let name = Symbol::from("_association_names");
-    if model.methods().any(|m| m.name == name && m.receiver == MethodReceiver::Class)
-        || methods
-            .iter()
-            .any(|m| m.name == name && m.receiver == MethodReceiver::Class)
-    {
+    let defines = |methods: &Vec<MethodDef>, name: &Symbol| {
+        model.methods().any(|m| m.name == *name && m.receiver == MethodReceiver::Class)
+            || methods.iter().any(|m| m.name == *name && m.receiver == MethodReceiver::Class)
+    };
+    if defines(methods, &Symbol::from("_association_names")) || model.associations().next().is_none() {
         return;
     }
-    let elements: Vec<Expr> = model
+    // In `_association_names`' order: `reflect_on_association` reads each by the name's index.
+    let names: Vec<Expr> = model.associations().map(|a| lit_sym(a.name().clone())).collect();
+    let macros: Vec<Expr> = model
         .associations()
-        .map(|a| lit_sym(a.name().clone()))
+        .map(|a| {
+            lit_sym(Symbol::from(match a {
+                Association::BelongsTo { .. } => "belongs_to",
+                Association::HasMany { .. } => "has_many",
+                Association::HasOne { .. } => "has_one",
+                Association::HasAndBelongsToMany { .. } => "has_and_belongs_to_many",
+            }))
+        })
         .collect();
-    if elements.is_empty() {
-        return;
+    let foreign_keys: Vec<Expr> = model
+        .associations()
+        .map(|a| {
+            let key = match a {
+                Association::BelongsTo { foreign_key, .. }
+                | Association::HasMany { foreign_key, .. }
+                | Association::HasOne { foreign_key, .. } => foreign_key.as_str().to_string(),
+                Association::HasAndBelongsToMany { .. } => String::new(),
+            };
+            let mut e = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: key } });
+            e.ty = Some(Ty::Str);
+            e
+        })
+        .collect();
+    let polymorphic: Vec<Expr> = model
+        .associations()
+        .map(|a| {
+            let mut e = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: matches!(a, Association::BelongsTo { polymorphic: true, .. }) } });
+            e.ty = Some(Ty::Bool);
+            e
+        })
+        .collect();
+    for (name, elements, elem) in [
+        ("_association_names", names, Ty::Sym),
+        ("_association_macros", macros, Ty::Sym),
+        ("_association_foreign_keys", foreign_keys, Ty::Str),
+        ("_association_polymorphic", polymorphic, Ty::Bool),
+    ] {
+        let name = Symbol::from(name);
+        if defines(methods, &name) {
+            continue;
+        }
+        let array = Ty::Array { elem: std::sync::Arc::new(elem) };
+        let mut body = Expr::new(Span::synthetic(), ExprNode::Array { elements, style: crate::expr::ArrayStyle::Brackets });
+        body.ty = Some(array.clone());
+        methods.push(MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name,
+            receiver: MethodReceiver::Class,
+            params: Vec::new(),
+            body,
+            signature: Some(fn_sig(vec![], array)),
+            effects: EffectSet::default(),
+            enclosing_class: Some(model.name.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
     }
-    let mut body = Expr::new(
-        Span::synthetic(),
-        ExprNode::Array {
-            elements,
-            style: crate::expr::ArrayStyle::Brackets,
-        },
-    );
-    body.ty = Some(Ty::Array {
-        elem: std::sync::Arc::new(Ty::Sym),
-    });
-    methods.push(MethodDef {
-        visibility: crate::dialect::MethodVisibility::Public,
-        unsupported_formals: None,
-        has_anonymous_block: false,
-        name_span: Span::synthetic(),
-        name,
-        receiver: MethodReceiver::Class,
-        params: Vec::new(),
-        body,
-        signature: Some(fn_sig(
-            vec![],
-            Ty::Array {
-                elem: std::sync::Arc::new(Ty::Sym),
-            },
-        )),
-        effects: EffectSet::default(),
-        enclosing_class: Some(model.name.0.clone()),
-        kind: AccessorKind::Method,
-        is_async: false,
-        mutates_self: false,
-        block_param: None,
-    });
 }
 
 /// `return <value> if new_record? && <owner key absent>`: Rails'
@@ -1942,6 +1980,7 @@ fn synth_polymorphic_writer(
     assoc_pk: &Symbol,
     sentinel: Expr,
     keeps_nil: bool,
+    key_held: bool,
 ) -> MethodDef {
     // def notifiable=(value)
     //   if value.nil?
@@ -2005,8 +2044,12 @@ fn synth_polymorphic_writer(
         ExprNode::If {
             cond: nil_check,
             // Rails clears both columns to nil; the ruby family does too.
+            // A key held unset for its presence check has a nilable slot
+            // on every target, so nil unsets it there too.
             then_branch: if keeps_nil {
                 seq(vec![assign(foreign_key, nil_lit()), assign(&type_col, nil_lit())])
+            } else if key_held {
+                seq(vec![assign(foreign_key, nil_lit()), assign(&type_col, lit_str(""))])
             } else {
                 seq(vec![assign(foreign_key, sentinel), assign(&type_col, lit_str(""))])
             },
@@ -2782,4 +2825,47 @@ pub(super) fn push_dependent_destroy(
             mutates_self: false,
             block_param: None,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The nil branch's assignments, as `(ivar, is_nil)`.
+    fn nil_branch(method: &MethodDef) -> Vec<(String, bool)> {
+        let ExprNode::If { then_branch, .. } = &*method.body.node else { panic!("{:?}", method.body) };
+        let ExprNode::Seq { exprs } = &*then_branch.node else { panic!("{then_branch:?}") };
+        exprs
+            .iter()
+            .map(|e| match &*e.node {
+                ExprNode::Assign { target: LValue::Ivar { name }, value } => {
+                    (name.as_str().to_string(), matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }))
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A strict target's polymorphic writer stores the key's sentinel for
+    /// nil, but nil for a key held unset (its slot is nilable), leaving
+    /// the type column its `""`.
+    #[test]
+    fn a_held_polymorphic_key_is_unset_by_nil() {
+        let writer = |key_held| {
+            synth_polymorphic_writer(
+                &ClassId(Symbol::from("Note")),
+                &Symbol::from("subject"),
+                &[ClassId(Symbol::from("Post"))],
+                &Symbol::from("subject_id"),
+                &Symbol::from("subject_type"),
+                &Symbol::from("id"),
+                lit_int(0),
+                false,
+                key_held,
+            )
+        };
+        let s = |n: &str, nil| (n.to_string(), nil);
+        assert_eq!(nil_branch(&writer(false)), vec![s("subject_id", false), s("subject_type", false)]);
+        assert_eq!(nil_branch(&writer(true)), vec![s("subject_id", true), s("subject_type", false)]);
+    }
 }

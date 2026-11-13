@@ -577,6 +577,8 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
         // %>` lowers to — renders nothing and does nothing: nothing is
         // dropped, so no residue line.
         ExprNode::Lit { .. } => vec![noop_io_append()],
+        // The branch an `if` whose condition the analysis settled leaves in its place (`<% if @resource.try(:x?) %>`).
+        ExprNode::Seq { .. } => walk_body(stmt, ctx),
         _ => vec![todo_io_append("unknown stmt", stmt.span)],
     }
 }
@@ -865,6 +867,16 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 "form_for :scope is lowered only with url: and no @scope record to fill its fields",
             ));
             return vec![accumulator_append_call(lit_str(String::new()), ctx)];
+        }
+        // `form_for(record, as: :user, url: …)`: form_with's `model:` form, with the class and id form_for gives the tag.
+        if method.as_str() == "form_for" {
+            match form_for_record_args(sa) {
+                Ok((args, html)) => return super::form_with::emit_form_for_inline(&args, block, ctx, html),
+                Err(why) => {
+                    crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(inner.span, None, Symbol::from("form_for"), why));
+                    return vec![accumulator_append_call(lit_str(String::new()), ctx)];
+                }
+            }
         }
         // `<%= form_tag(action, opts) do ...inner... %>` — the
         // builder-less bare form, same inline expansion minus the
@@ -1482,9 +1494,16 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                         params.iter().chain(extra_params.iter().map(|p| &p.name)).map(|p| p.as_str().to_string()),
                     )
                 };
+                // A helper a gem mixes into the view (`simple_form_for`): Rails' method, on a view context, whose block's
+                // capture is the template's markup, a safe buffer.
+                let on_view_context = recv.is_none() && ctx.view_context_helpers.contains(method.as_str());
                 let mut cap_stmts = vec![assign_accumulator_string_new(cap)];
                 cap_stmts.extend(walk_body(body, &cap_ctx));
-                cap_stmts.push(accumulator_result_ref(cap));
+                cap_stmts.push(if on_view_context {
+                    Expr::new(Span::synthetic(), ExprNode::Send { recv: Some(accumulator_result_ref(cap)), method: Symbol::from("html_safe"), args: Vec::new(), block: None, parenthesized: false })
+                } else {
+                    accumulator_result_ref(cap)
+                });
                 let new_block = Expr::new(
                     block.span,
                     ExprNode::Lambda { rest_param: rest_param.clone(), extra_params: extra_params.clone(),
@@ -1494,10 +1513,17 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                         block_style: *block_style,
                     },
                 );
+                let view_context = Expr::new(Span::synthetic(), ExprNode::Send {
+                    recv: Some(Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("Base")] })),
+                    method: Symbol::from("new"),
+                    args: Vec::new(),
+                    block: None,
+                    parenthesized: false,
+                });
                 let rebuilt = Expr::new(
                     inner.span,
                     ExprNode::Send {
-                        recv: recv.as_ref().map(|r| rewrite_helpers_in_expr(r, ctx)),
+                        recv: if on_view_context { Some(view_context) } else { recv.as_ref().map(|r| rewrite_helpers_in_expr(r, ctx)) },
                         method: method.clone(),
                         args: sa.iter().map(|a| rewrite_helpers_in_expr(a, ctx)).collect(),
                         block: Some(new_block),
@@ -1873,6 +1899,16 @@ pub(super) fn classify_template_helper<'a>(
 /// before the html_escape wrap, matching the convention every
 /// emitter would otherwise have to repeat.
 pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
+    // `link_to "Back", :back` by any route a link takes: `:back` is Rails' `url_for(:back)`, the referrer.
+    if let ExprNode::Send { recv: None, method, args, block, parenthesized } = &*e.node
+        && method.as_str() == "link_to"
+        && args.get(1).is_some_and(|a| matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "back"))
+    {
+        let mut args = args.clone();
+        args[1] = super::view_helpers_call("back_url", Vec::new());
+        let swapped = Expr { node: Box::new(ExprNode::Send { recv: None, method: method.clone(), args, block: block.clone(), parenthesized: *parenthesized }), ..e.clone() };
+        return rewrite_helpers_in_expr(&swapped, ctx);
+    }
     // `x.presence` in a view's output (`<%= r[:title].presence || t(...) %>`):
     // ActiveSupport's Object#presence, which only the CRuby overlay can
     // reopen onto every value. `lower::blank` grounds it in app bodies but
@@ -2421,6 +2457,7 @@ mod tests {
             store_readers: Default::default(),
             route_helper_names: Default::default(),
             app_helper_names: Default::default(),
+            view_context_helpers: Default::default(),
             direct_route_helpers: Default::default(),
             i18n: Default::default(),
             route_helper_arity: Default::default(),
@@ -3611,6 +3648,64 @@ fn emit_cached_fragment(
 /// `form_for :scope, k: v, ...` as `form_with(scope: :scope, k: v, ...)`.
 /// None for a record form (`form_for @user`), which names and fills its
 /// fields from the record.
+/// `form_for(record, opts)` as form_with's arguments: `as:` is its `scope:`, the verb is the record's (Rails'
+/// `apply_form_for_options!`), and `html:` (with a top-level `data:`, which Rails moves into it) renders on the tag.
+fn form_for_record_args(args: &[Expr]) -> Result<(Vec<Expr>, super::form_with::FormForHtml), String> {
+    let (record, rest) = args.split_first().ok_or("form_for is lowered only with a record")?;
+    let opts: Vec<(Expr, Expr)> = match rest {
+        [] => Vec::new(),
+        [opts] => match &*opts.node {
+            ExprNode::Hash { entries, .. } => entries.clone(),
+            _ => return Err("form_for is lowered only with its options written as a Hash".into()),
+        },
+        _ => return Err("form_for is lowered only with a record and an options Hash".into()),
+    };
+    let sym = |k: &str| Expr::new(record.span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(k) } });
+    let mut entries = vec![(sym("model"), record.clone())];
+    let mut html = Vec::new();
+    let mut named = false;
+    let mut method = false;
+    for (k, v) in opts {
+        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
+            return Err("form_for is lowered only with Symbol option keys".into());
+        };
+        match key.as_str() {
+            "as" => {
+                if super::form_with::str_or_sym_literal(&v).is_none() {
+                    return Err("form_for is lowered only with `as:` a literal name: the field names are written from it".into());
+                }
+                named = true;
+                entries.push((sym("scope"), v));
+            }
+            "url" | "namespace" => entries.push((k, v)),
+            "method" => {
+                method = true;
+                entries.push((k, v));
+            }
+            "html" => match &*v.node {
+                ExprNode::Hash { entries: inner, .. } => {
+                    for (hk, hv) in inner {
+                        if matches!(&*hk.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "method") {
+                            method = true;
+                            entries.push((hk.clone(), hv.clone()));
+                        } else {
+                            html.push((hk.clone(), hv.clone()));
+                        }
+                    }
+                }
+                _ => return Err("form_for is lowered only with `html:` written as a Hash".into()),
+            },
+            "data" => html.push((k, v)),
+            other => return Err(format!("form_for's `{other}:` option is not lowered")),
+        }
+    }
+    if !method {
+        let persisted = Expr::new(record.span, ExprNode::Send { recv: Some(record.clone()), method: Symbol::from("persisted?"), args: Vec::new(), block: None, parenthesized: false });
+        entries.push((sym("method"), Expr::new(record.span, ExprNode::If { cond: persisted, then_branch: sym("patch"), else_branch: sym("post") })));
+    }
+    Ok((vec![Expr::new(record.span, ExprNode::Hash { entries, kwargs: true })], super::form_with::FormForHtml { html, named }))
+}
+
 fn form_for_scope_args(args: &[Expr], ctx: &ViewCtx) -> Option<Vec<Expr>> {
     let (first, rest) = args.split_first()?;
     let ExprNode::Lit { value: Literal::Sym { value: scope } } = &*first.node else { return None };

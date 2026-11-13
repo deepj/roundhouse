@@ -472,6 +472,26 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || body_registers_autoloads(m.body())
         || body_extends_module(m.body())
         || concern_includes_module(m.body())
+        || body_hands_itself_out(m.body())
+}
+
+/// A module whose body hands itself to a call as it loads (devise's `Devise::Models.config(self, :pepper)`
+/// in a `ClassMethods`, `Registry.register(self)`): what that call does to it, ingest can only carry
+/// on a module that exists.
+fn body_hands_itself_out(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    flatten_statements(body).iter().any(|stmt| {
+        // Not only its own body: a nested `ClassMethods` is folded into this module's class side.
+        if let Some(m) = stmt.as_module_node()
+            && module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()])
+        {
+            return body_hands_itself_out(m.body());
+        }
+        stmt.as_call_node().is_some_and(|call| {
+            call.receiver().is_some_and(|r| constant_path_of(&r).is_some())
+                && call.arguments().is_some_and(|a| a.arguments().iter().any(|arg| arg.as_self_node().is_some()))
+        })
+    })
 }
 
 /// A Concern whose body only includes other modules. It has nothing of
@@ -611,7 +631,17 @@ fn body_has_route_helpers_include(body: Option<Node<'_>>) -> bool {
 /// Match the `Rails.application.routes.url_helpers` receiver chain (a
 /// nested CallNode ladder rooted at the `Rails` constant).
 pub(super) fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
-    let mut expected = ["url_helpers", "routes", "application"].iter();
+    is_rails_routes_chain(node, "url_helpers")
+}
+
+/// `Rails.application.routes.mounted_helpers`: the module that answers `main_app`, the app's routes.
+pub(super) fn is_rails_mounted_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
+    is_rails_routes_chain(node, "mounted_helpers")
+}
+
+fn is_rails_routes_chain(node: &ruby_prism::Node<'_>, last: &str) -> bool {
+    let names = [last, "routes", "application"];
+    let mut expected = names.iter();
     let mut cur = match node.as_call_node() {
         Some(c) => c,
         None => return false,

@@ -51,6 +51,7 @@ use super::{fn_sig, ty_of_column};
 
 mod exists;
 use exists::{synth_adapter_any, synth_adapter_exists_by_id};
+pub(super) mod uniqueness;
 
 pub(super) fn push_adapter_methods(
     methods: &mut Vec<MethodDef>,
@@ -951,8 +952,10 @@ fn synth_adapter_reload(model: &Model, table: &Table, param: bool) -> MethodDef 
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![].into() };
 
     // Rails' `reload` clears the association cache — owned by
-    // associations (same kinds as `assoc_cache_ivar_bindings`).
-    let clear_assoc = super::associations::clear_loaded_flag_assigns(model);
+    // associations (same kinds as `assoc_cache_ivar_bindings`) — and
+    // the attachment proxies and unsaved attachment assignments.
+    let mut clear_assoc = super::associations::clear_loaded_flag_assigns(model);
+    clear_assoc.extend(crate::lower::attached::reload_resets(model));
 
     // SQL: "SELECT <cols> FROM <table> WHERE id = " + Db.escape_int(@id) + " LIMIT 1"
     let cols_csv: String = table
@@ -1435,6 +1438,9 @@ fn value_type_for_column(col: &crate::schema::Column) -> ValueType {
         return ValueType::StrOpt;
     }
     let nullable = (col.nullable || col.persisted_computed_default().is_some()) && !col.primary_key;
+    if col.col_type == crate::schema::ColumnType::Binary {
+        return if nullable { ValueType::BinaryOpt } else { ValueType::Binary };
+    }
     match ty_of_column(&col.col_type) {
         Ty::Int => {
             if nullable {

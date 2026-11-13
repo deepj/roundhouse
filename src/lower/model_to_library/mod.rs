@@ -260,16 +260,129 @@ pub fn lower_models_to_library_classes_unfolding(
     lower_models_inner(models, schema, extra_class_infos, params_specs, unfolded, Materialization::Emit, FinderInputs::Request).0
 }
 
-/// Register raw-input finders only for Ruby-family controller/test consumers.
-pub(crate) fn lower_models_with_request_finders(
+/// What one model lowering with raw-input finders leaves behind besides
+/// its classes: the registry, the diagnostics it reported, and how many
+/// read ids it took.
+struct RequestFinderRegistry {
+    registry: std::rc::Rc<HashMap<ClassId, crate::analyze::ClassInfo>>,
+    diagnostics: Vec<crate::diagnostic::Diagnostic>,
+    read_ids: usize,
+}
+
+type SharedRegistry = (usize, usize, usize, std::rc::Rc<std::cell::OnceCell<std::rc::Rc<RequestFinderRegistry>>>);
+
+thread_local! {
+    static REQUEST_FINDER_REGISTRY: std::cell::RefCell<Option<SharedRegistry>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previously shared registry when dropped. It borrows the
+/// models and the schema, so neither can change while it is shared.
+pub(crate) struct RequestFinderRegistryGuard<'a>(Option<SharedRegistry>, std::marker::PhantomData<(&'a [Model], &'a Schema)>);
+
+impl Drop for RequestFinderRegistryGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        REQUEST_FINDER_REGISTRY.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+thread_local! {
+    static MODULE_WRITERS: std::cell::RefCell<HashMap<String, Vec<Symbol>>> = std::cell::RefCell::new(HashMap::default());
+}
+
+/// The public writers (`def x=`) of each library module, for the mass assignment of the models that include them,
+/// held for the guard's life.
+pub(crate) struct ModuleWritersGuard(HashMap<String, Vec<Symbol>>);
+
+impl Drop for ModuleWritersGuard {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        MODULE_WRITERS.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+pub(crate) fn share_module_writers(app: &crate::App) -> ModuleWritersGuard {
+    let mut writers: HashMap<String, Vec<Symbol>> = HashMap::default();
+    for lc in app.library_classes.iter().filter(|c| c.is_module) {
+        for m in lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.visibility == crate::dialect::MethodVisibility::Public) {
+            let Some(base) = m.name.as_str().strip_suffix('=') else { continue };
+            let mut chars = base.chars();
+            if chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let list = writers.entry(lc.name.0.as_str().to_string()).or_default();
+                if !list.iter().any(|w| w.as_str() == base) {
+                    list.push(Symbol::from(base));
+                }
+            }
+        }
+    }
+    ModuleWritersGuard(MODULE_WRITERS.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), writers)))
+}
+
+pub(crate) fn included_module_writers(module: &str) -> Vec<Symbol> {
+    MODULE_WRITERS.with(|slot| slot.borrow().get(module).cloned().unwrap_or_default())
+}
+
+/// Share [`request_finder_registry`] of `models` and `schema` among its
+/// callers for the guard's life. The Spinel and Ruby-family assembly asks
+/// for it once per controller lowering and once for the tests, each of
+/// which lowered every model again to throw the classes away. A guard
+/// inside another for the same models and schema shares the outer one's.
+pub(crate) fn share_request_finder_registry<'a>(models: &'a [Model], schema: &'a Schema) -> RequestFinderRegistryGuard<'a> {
+    let key = (models.as_ptr() as usize, models.len(), schema as *const Schema as usize);
+    let previous = REQUEST_FINDER_REGISTRY.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let cell = slot.as_ref().filter(|(m, n, s, _)| (*m, *n, *s) == key).map(|(_, _, _, cell)| cell.clone()).unwrap_or_default();
+        slot.replace((key.0, key.1, key.2, cell))
+    });
+    RequestFinderRegistryGuard(previous, std::marker::PhantomData)
+}
+
+/// The class registry of the models lowered with raw-input finders, for
+/// the Ruby-family controller/test consumers that type against it, with
+/// the diagnostics that lowering reports pushed to the active emit sink
+/// when `report` (a caller that only wants the registry drops them).
+///
+/// Computed once per [`share_request_finder_registry`] guard. A cached
+/// call stands in for a run exactly: it pushes the same diagnostics and
+/// takes the same read ids (`lower::arel::visitor::skip_read_ids`).
+pub(crate) fn request_finder_registry(
     models: &[Model],
     schema: &Schema,
-    extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
-) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
-    lower_models_inner(
-        models, schema, extra_class_infos, &Default::default(), &Default::default(),
-        Materialization::Emit, FinderInputs::Request,
-    )
+    report: bool,
+) -> std::rc::Rc<HashMap<ClassId, crate::analyze::ClassInfo>> {
+    let compute = || {
+        let before = crate::lower::arel::visitor::read_ids_taken();
+        let ((_, registry), diagnostics) = crate::emit::diagnostics::scope(|| {
+            lower_models_inner(
+                models, schema, Vec::new(), &Default::default(), &Default::default(),
+                Materialization::Emit, FinderInputs::Request,
+            )
+        });
+        let read_ids = crate::lower::arel::visitor::read_ids_taken() - before;
+        std::rc::Rc::new(RequestFinderRegistry { registry: std::rc::Rc::new(registry), diagnostics, read_ids })
+    };
+    let shared = REQUEST_FINDER_REGISTRY.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(m, n, s, _)| (*m, *n, *s) == (models.as_ptr() as usize, models.len(), schema as *const Schema as usize))
+            .map(|(_, _, _, cell)| cell.clone())
+    });
+    let (entry, cached) = match shared {
+        Some(cell) => {
+            let hit = cell.get().cloned();
+            (hit.clone().unwrap_or_else(|| cell.get_or_init(compute).clone()), hit.is_some())
+        }
+        None => (compute(), false),
+    };
+    if cached {
+        crate::lower::arel::visitor::skip_read_ids(entry.read_ids);
+    }
+    if report {
+        for d in &entry.diagnostics {
+            crate::emit::diagnostics::push(d.clone());
+        }
+    }
+    entry.registry.clone()
 }
 
 /// Build one registry for the complete model graph, then type the selected
@@ -309,7 +422,12 @@ pub(crate) fn lower_models_inner_with_ruby_values(
     runtime_relation: RuntimeRelation,
     partial_stems: &crate::lower::view_to_library::PartialStems,
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
+    // Every target's lowering holds a NOT NULL integer that `presence:`
+    // checks unset until assigned, as Rails reads it nil until then.
+    let unset_schema = crate::lower::validations::hold_unset_presence_columns(models, schema);
+    let schema = &unset_schema;
     let mut all_methods: Vec<(Vec<MethodDef>, ClassId, Option<&Table>, &Model)> = Vec::new();
+    let string_enums = if ruby_read_values { crate::lower::arel::StringEnums::of_models(models, schema) } else { Default::default() };
     let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::default();
     let _body_names = schema::share_model_body_names(models, &Default::default());
     for model in models {
@@ -505,11 +623,14 @@ pub(crate) fn lower_models_inner_with_ruby_values(
                 && (unfolded.contains(&key) || relation_returns.contains_key(&key));
             if !unfold {
                 crate::lower::arel::rewrite_arel_in_expr_with_ruby_values(
-                    &mut method.body, schema, &classes, &[], ruby_read_values,
+                    &mut method.body, schema, &classes, &[], ruby_read_values.then_some(&string_enums),
                     &relation_class_methods,
                     crate::lower::arel::SqliteVisitor { param_binds },
                 );
             }
+            // After the Arel pass, which inlines a finder over `@<col>`
+            // (an association reader) and not over a reader call.
+            read_held_columns_through_readers(std::slice::from_mut(method), table);
             type_method_body(method, &classes, table, Some(model));
         }
         out.push(model_class(model, methods, table));
@@ -1127,6 +1248,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         if name == "primary_abstract_class" {
             continue;
         }
+        // `self.abstract_class = true|false` — the older spelling of the
+        // same marker, read in order by `markers::is_abstract_class`.
+        if name == "abstract_class=" && self::markers::is_literal_abstract_class_write(expr) {
+            continue;
+        }
         // `include Notifications` — a model concern, spliced by the
         // analyzer (`model_includes` + `concern_model_items`) into the
         // includer's registry and lowered with its methods; nothing is
@@ -1498,7 +1624,7 @@ fn build_methods_with_finder_inputs(
         let writable_fields =
             permitted_fields.map(|fields| writable_permit_fields(model, Some(table), fields));
         let permitted_fields = writable_fields.as_deref();
-        push_schema_methods(&mut methods, model, models, table, &through_joins, runtime_relation);
+        push_schema_methods(&mut methods, model, models, table, &through_joins, runtime_relation, schema.expression_dialect);
         // Per-model Level-3 adapter primitives (`_adapter_find_by_id`, etc.)
         // — typed methods that go directly from SQL composition to typed
         // model instances over the `Sqlite` primitive surface. See
@@ -1614,8 +1740,8 @@ fn build_methods_with_finder_inputs(
             })
         })
         .unwrap_or_else(|| Symbol::from("id"));
-    push_validate_method(&mut methods, model, errors_readers, runtime_relation, &primary_key);
-    push_association_methods(&mut methods, model, models, &through_joins, runtime_relation);
+    push_validate_method(&mut methods, model, errors_readers, runtime_relation, &primary_key, schema.tables.get(&model.table.0), schema);
+    push_association_methods(&mut methods, model, models, &through_joins, runtime_relation, schema.tables.get(&model.table.0));
     push_dependent_destroy(&mut methods, model, &through_joins);
     push_unknown_marker_methods(&mut methods, model);
     push_attr_accessor_methods(&mut methods, model);
@@ -3159,7 +3285,10 @@ fn type_method_body(
             ctx.local_bindings.insert(param.name.clone(), (*sig.ty).clone());
         }
     }
-    if let Some(enclosing) = &method.enclosing_class {
+    // Not the module a method was written in when it runs in the model: an included or extended module's method
+    // (Devise's `serialize_from_session`) has the model as `self`, and the module answers none of the model's methods.
+    let enclosing = method.enclosing_class.as_ref().filter(|e| model.is_none_or(|m| m.name.0 == **e));
+    if let Some(enclosing) = enclosing {
         ctx.self_ty = Some(Ty::Class {
             id: ClassId(enclosing.clone()),
             args: vec![].into(),
@@ -3475,15 +3604,61 @@ pub(super) fn is_id_column(name: &Symbol) -> bool {
     s == "id" || s.ends_with("_id")
 }
 
+/// A column held unset for its presence check
+/// (`validations::hold_unset_presence_columns`) has no `@<col>` slot:
+/// a body that reads it (a `belongs_to`'s reader and autosave, a model
+/// method) reads its reader, which answers 0 until it is assigned, as
+/// the slot did before; one that assigns it calls its writer, or unsets
+/// `@<col>_raw` for a nil.
+fn read_held_columns_through_readers(methods: &mut [MethodDef], table: Option<&Table>) {
+    use crate::expr::{Expr, ExprNode, LValue};
+    fn rewrite(expr: &mut Expr, col: &Symbol, storage: &Symbol) {
+        expr.node.for_each_child_mut(&mut |c| rewrite(c, col, storage));
+        match &mut *expr.node {
+            ExprNode::Ivar { name } if name == col => {
+                *expr.node = ExprNode::Send { recv: None, method: col.clone(), args: vec![], block: None, parenthesized: false };
+            }
+            // `@<col> = nil` unsets the slot; any other value goes
+            // through the writer, which fills it (so a strict target's
+            // slot stays nilable however the body's value is typed).
+            ExprNode::Assign { target: LValue::Ivar { name }, value } if name == col => {
+                if matches!(&*value.node, ExprNode::Lit { value: crate::expr::Literal::Nil }) {
+                    *name = storage.clone();
+                } else {
+                    let value = value.clone();
+                    *expr.node = ExprNode::Send {
+                        recv: Some(Expr::new(expr.span, ExprNode::SelfRef)),
+                        method: Symbol::from(format!("{}=", col.as_str())),
+                        args: vec![value],
+                        block: None,
+                        parenthesized: false,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(table) = table else { return };
+    for col in table.columns.iter().filter(|c| c.unset_until_assigned) {
+        let storage = schema::col_storage_name(col);
+        // Instance methods only: a class method's `@<col>` is the class's own state.
+        for method in methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance) {
+            rewrite(&mut method.body, &col.name, &storage);
+        }
+    }
+}
+
 /// The schema columns a class stores that the DB declares nullable —
 /// the `LibraryClass::nullable_columns` payload. Same rule as
-/// `ty_of_column_slot`: nullable, primary key excluded.
+/// `ty_of_column_slot`: nullable, primary key excluded. A column held
+/// unset for its presence check is named by its `<col>_raw` slot, the
+/// nilable field; its reader answers the column's own type.
 pub(crate) fn nullable_column_names(table: Option<&Table>) -> Vec<Symbol> {
     let Some(t) = table else { return Vec::new() };
     t.columns
         .iter()
         .filter(|c| c.nullable && !c.primary_key)
-        .map(|c| c.name.clone())
+        .map(|c| if c.unset_until_assigned { schema::col_storage_name(c) } else { c.name.clone() })
         .collect()
 }
 
@@ -3491,6 +3666,58 @@ pub(crate) fn nullable_column_names(table: Option<&Table>) -> Vec<Symbol> {
 mod tests {
     use super::*;
     use std::{collections::HashMap, path::PathBuf};
+
+    /// The held column's `@<col>` reads become reader calls in instance
+    /// methods only; a class method's `@<col>` is the class's own state.
+    #[test]
+    fn held_column_reads_rewrite_in_instance_methods_only() {
+        let method = |receiver| MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name: Symbol::from("cached"),
+            receiver,
+            params: Vec::new(),
+            body: Expr::new(Span::synthetic(), ExprNode::Ivar { name: Symbol::from("quota") }),
+            signature: None,
+            effects: crate::effect::EffectSet::default(),
+            enclosing_class: None,
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        };
+        let table = crate::schema::Table {
+            name: Symbol::from("plans"),
+            columns: vec![crate::schema::Column {
+                name: Symbol::from("quota"),
+                col_type: crate::schema::ColumnType::Integer,
+                nullable: true,
+                default: None,
+                default_expression: None,
+                legacy_default_persistence: false,
+                primary_key: false,
+                generated: None,
+                generated_text_compatible: None,
+                generated_int4_compatible: None,
+                array: false,
+                array_stored: false,
+                unset_until_assigned: true,
+                collated: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+            known_keyless: false,
+            primary_key_columns: Vec::new(),
+            virtual_module: None,
+        };
+        let mut methods = vec![method(MethodReceiver::Instance), method(MethodReceiver::Class)];
+        read_held_columns_through_readers(&mut methods, Some(&table));
+        assert!(matches!(&*methods[0].body.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "quota"), "{:?}", methods[0].body);
+        assert!(matches!(&*methods[1].body.node, ExprNode::Ivar { name } if name.as_str() == "quota"), "{:?}", methods[1].body);
+    }
 
     /// Framework normalization must not replace a same-named application class.
     #[test]

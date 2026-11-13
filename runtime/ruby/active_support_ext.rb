@@ -43,6 +43,8 @@ require_relative "active_support_number_helper"
 #
 # Other objects use Rails' optional `empty?` protocol. Their `to_s`
 # says nothing about blankness and may even return nil.
+require_relative "json_builder"
+
 module ActiveSupport
   # `ActiveSupport::JSON` — Rails' JSON coder over the json library.
   #
@@ -151,6 +153,11 @@ module ActiveSupport
   # anything that answers `duplicable?` with false is itself; anything
   # else is its `dup` (an Integer's, nil's or a Symbol's is itself).
   # `lower::symbolize_keys` routes a typed Hash or Array receiver here.
+  # Not a table of hooks to run: an `on_load` block is carried into its class when the app is read, or reported.
+  def self.run_load_hooks(name, base = nil)
+    nil
+  end
+
   def self.deep_dup(value)
     case value
     when Array then value.map { |item| ActiveSupport.deep_dup(item) }
@@ -506,6 +513,41 @@ module ActiveSupport
   # `rescue_from(ActiveSupport::MessageVerifier::InvalidSignature) {
   # head :not_found }` over an avatar URL that carries a signed id.
   #
+  # Not `Rails.log_line`, which a host logger may filter, nor `$stderr`
+  # or `STDERR` puts, which the runtime's typing cannot type: Kernel#warn,
+  # which `-W0` silences where Rails' :stderr behavior would still write.
+  def self.deprecation_line(line)
+    warn(line)
+  end
+
+  # Rails' deprecator a gem keeps for itself (`Devise.deprecator`): `warn`
+  # writes Rails' line to stderr, the default behavior of a deprecator
+  # the app's `config.active_support.deprecation` has not configured.
+  class Deprecation
+    attr_reader :deprecation_horizon, :gem_name
+    attr_accessor :silenced
+
+    def initialize(deprecation_horizon = "next release", gem_name = "Rails")
+      @deprecation_horizon = deprecation_horizon
+      @gem_name = gem_name
+      @silenced = false
+    end
+
+    # Not Rails' "(called from …)" suffix: no target keeps the caller's location.
+    def warn(message = nil, callstack = nil)
+      return nil if @silenced
+      ActiveSupport.deprecation_line("DEPRECATION WARNING: #{message}")
+      nil
+    end
+
+    # Rails installs a `const_missing` hook that warns and answers the
+    # replacement. Not ported: a hook no target has, and a program that
+    # reads no deprecated name never calls it (`deprecate_constant` is
+    # refused where one is read).
+    module DeprecatedConstantAccessor
+    end
+  end
+
   # A namespace with no verifier in it, because ours is
   # `ActionController::MessageVerifier` (it serves the cookie jar first).
   # The error keeps Rails' path so app code that names it resolves.
@@ -514,6 +556,42 @@ module ActiveSupport
       def initialize(message = "ActiveSupport::MessageVerifier::InvalidSignature")
         super(message)
       end
+    end
+  end
+
+  # Rails' PBKDF2 key derivation (`ActiveSupport::KeyGenerator`): `secret` stretched with each salt it is asked for,
+  # 2**16 iterations by default, by the SHA256 digest a `load_defaults 7.0` app sets as its `hash_digest_class`.
+  # Not SHA1, an older app's: the digest primitives this runtime carries derive by SHA256 only.
+  class KeyGenerator
+    def initialize(secret, options = {})
+      digest = options[:hash_digest_class]
+      # Not a SHA256 key under another digest's name: it would never match the keys that digest derived.
+      raise ArgumentError, "hash_digest_class #{digest} is not supported; keys derive by SHA256" unless digest.nil? || digest.to_s.end_with?("SHA256")
+      @secret = secret
+      iterations = options[:iterations]
+      @iterations = iterations.nil? ? 65536 : iterations.to_i
+    end
+
+    def generate_key(salt, key_size = 64)
+      MessageDigest.pbkdf2_sha256(@secret, salt, @iterations, key_size)
+    end
+  end
+
+  # `ActiveSupport::CachingKeyGenerator`: each salt and size derived once, as the stretch is the slow part.
+  class CachingKeyGenerator
+    def initialize(key_generator)
+      @key_generator = key_generator
+      @cache_keys = {}
+    end
+
+    def generate_key(salt, key_size = 64)
+      cache_key = "#{salt}|#{key_size}"
+      key = @cache_keys[cache_key]
+      if key.nil?
+        key = @key_generator.generate_key(salt, key_size)
+        @cache_keys[cache_key] = key
+      end
+      key
     end
   end
 
@@ -543,6 +621,28 @@ module ActiveSupport
   # subtracting them.
   def self.excluding(list, *elements)
     list - elements.flatten(1)
+  end
+
+  # AS `Array#extract_options!` (`lower::enumerable_ext`): the trailing
+  # Hash, removed from the Array it was called on, or a new empty one.
+  # Only a plain Hash, as Rails' `Hash#extractable_options?` answers
+  # (`instance_of?(Hash)`): a subclass stays in the Array.
+  # AS `Hash#assert_valid_keys`: the first key outside the list raises, naming the list.
+  def self.assert_valid_keys(hash, valid_keys)
+    # Not the list as given: Rails flattens it, so `assert_valid_keys(KEYS)` and `(:a, [:b])` name the same keys.
+    keys = valid_keys.flatten
+    hash.keys.each do |key|
+      unless keys.include?(key)
+        raise ArgumentError, "Unknown key: #{key.inspect}. Valid keys are: #{keys.map { |valid| valid.inspect }.join(", ")}"
+      end
+    end
+    hash
+  end
+
+  def self.extract_options!(list)
+    last = list.last
+    return list.pop if last.instance_of?(Hash)
+    {}
   end
 
   # AS `Enumerable#pluck` on a receiver the analyzer could not type
@@ -769,6 +869,16 @@ module ActiveSupport
     return out if hash.nil?
     hash.each { |key, item| out[ActiveSupport.indifferent_key(key)] = ActiveSupport.indifferent_value(item, false) }
     out
+  end
+
+  # A Hash a parameter takes where an indifferent one reaches it too: one keyed by Symbol converted, one keyed by String
+  # kept, as the caller's indifferent hash is the one Rails writes in place.
+  def self.indifferent_param(hash)
+    return hash if hash.nil?
+    # Not a value of another class a union lets in (a String): only a Hash has keys to convert.
+    return hash unless hash.is_a?(Hash)
+    return hash if hash.keys.all? { |key| key.is_a?(String) }
+    ActiveSupport.indifferent(hash)
   end
 
   # Not a copy for every Array: Rails converts one written by `[]=` in place, unless it is frozen.

@@ -110,6 +110,7 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<(bool, Vec
         stmts.iter().all(|stmt| {
             definition(stmt).is_some()
                 || conditional_accessor(stmt).is_some()
+                || self_write(stmt).is_some()
                 || conditional_definition(stmt).is_some()
                 || stmt.as_class_node().is_some()
                 || stmt.as_module_node().is_some()
@@ -158,6 +159,7 @@ fn refused_conditional_definition<'pr>(node: &Node<'pr>) -> Option<(Node<'pr>, &
     let admitted = |stmt: &Node<'_>| {
         definition(stmt).is_some()
             || conditional_accessor(stmt).is_some()
+            || self_write(stmt).is_some()
             || conditional_definition(stmt).is_some()
             || stmt.as_class_node().is_some()
             || stmt.as_module_node().is_some()
@@ -182,6 +184,18 @@ fn refused_conditional_definition<'pr>(node: &Node<'pr>) -> Option<(Node<'pr>, &
         "a load-time conditional definition whose branch holds a statement other than a `def` is not modeled"
     };
     Some((stmt, why))
+}
+
+/// `self.error_status = :ok`: a write through the class's own writer, as a branch runs it.
+pub(super) fn self_write<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
+    let call = stmt.as_call_node()?;
+    let name = constant_id_str(&call.name());
+    (call.receiver().is_some_and(|r| r.as_self_node().is_some())
+        && call.block().is_none()
+        && name.ends_with('=')
+        && !matches!(name, "==" | "!=" | "<=" | ">=" | "===")
+        && call.arguments().is_some_and(|a| a.arguments().iter().count() == 1))
+    .then_some(call)
 }
 
 /// A bare `attr_reader` / `attr_writer` / `attr_accessor` of literal
@@ -431,9 +445,28 @@ impl Visibility {
     ) -> IngestResult<Self> {
         let out = Self::resolve_carrying_inherited_with(body, file, module_owner, owner, true)?;
         match out.inherited.first() {
-            Some((_, name, _)) => Err(Self::undefined(file, name)),
+            Some((_, name, at)) => {
+                let err = Self::undefined(file, name);
+                super::error_site::note(&err, *at, *at + 1);
+                Err(err)
+            }
             None => Ok(out),
         }
+    }
+
+    /// [`Self::resolve_library`] for a class body whose walk carries a marker naming an inherited method as a body
+    /// statement (Hashie's `private :_regular_reader` after `alias _regular_reader []`), which the Ruby family writes
+    /// back and Ruby resolves along the ancestors.
+    /// [`Self::resolve_library`] for a class body whose walk carries a marker naming an inherited method as a body
+    /// statement (Hashie's `private :_regular_reader` after `alias _regular_reader []`), which the Ruby family writes
+    /// back and Ruby resolves along the ancestors.
+    pub(super) fn resolve_library_carrying(
+        body: Option<&Node<'_>>,
+        file: &str,
+        module_owner: Option<&ClassId>,
+        owner: Option<&ClassId>,
+    ) -> IngestResult<Self> {
+        Self::resolve_carrying_inherited_with(body, file, module_owner, owner, true)
     }
 
     /// Whether this body's load-time conditional definitions are admitted.
@@ -489,10 +522,12 @@ impl Visibility {
             out.walk(Some(statements.as_node()), false, file, module_owner)?;
         }
         // Ruby raises NameError at the marker for a later `def` or one only on the other side, so those are no inherited method.
-        if let Some((_, name, _)) = out.inherited.iter().find(|(class_side, name, _)| {
+        if let Some((_, name, at)) = out.inherited.iter().find(|(class_side, name, _)| {
             out.known.contains_key(&(*class_side, name.clone())) || out.known.contains_key(&(!*class_side, name.clone()))
         }) {
-            return Err(Self::undefined(file, name));
+            let err = Self::undefined(file, name);
+            super::error_site::note(&err, *at, *at + 1);
+            return Err(err);
         }
         Ok(out)
     }

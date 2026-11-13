@@ -27,11 +27,15 @@ use crate::ty::Ty;
 
 /// A condition on the including class, read from a concern's
 /// `included do`: `self == A` / `self != A` / `in?([A, B])`, under `if`
-/// or `unless`. `classes` are the constants as written.
+/// or `unless`. `classes` are the constants as written. `asked` is instead
+/// a module's predicate of the includer, `Devise::Orm.active_record?(self)`:
+/// the module and the method, which a gem hook answers per includer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IncluderGuard {
     pub classes: Vec<String>,
     pub negate: bool,
+    #[serde(default)]
+    pub asked: Option<(String, String)>,
 }
 
 impl IncluderGuard {
@@ -131,6 +135,14 @@ pub struct App {
     /// (`ingest::boot_program`): run at boot on the ruby family and spinel.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boot_program: Vec<Expr>,
+    /// The statements of [`App::boot_program`] that a gem file runs as it
+    /// loads (`ingest::gem_load_program`): the ruby family leaves them to
+    /// the file's program, which runs them where the file is required.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gem_load_statements: Vec<crate::span::Span>,
+    /// The gem files the boot loads, as `ingest::gem_load_program` walks them (normalized source paths).
+    #[serde(default, skip_serializing_if = "crate::det::HashSet::is_empty")]
+    pub gem_loaded_files: crate::det::HashSet<String>,
     /// The constants an initializer statement held by a gem not compiled
     /// from source calls (`Rack::Attack` of `Rack::Attack.throttle`):
     /// `ingest::auto_source_gems` brings that gem in, and the statement
@@ -146,6 +158,10 @@ pub struct App {
     /// as brace-block Ruby the stack hands the constructor.
     #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
     pub gem_middleware_blocks: crate::det::HashMap<String, String>,
+    /// The arguments a `use` passes its middleware after the app it wraps, by class, as Ruby source
+    /// (`*Devise.omniauth_configs[:github].args` for a provider Devise's loop unrolled to).
+    #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
+    pub gem_middleware_args: crate::det::HashMap<String, String>,
     /// The Rack env keys a stacked middleware writes, and the class there (`"warden"` → `Warden::Proxy`).
     #[serde(default, skip_serializing_if = "crate::det::HashMap::is_empty")]
     pub rack_env_writes: crate::det::HashMap<String, String>,
@@ -161,6 +177,9 @@ pub struct App {
     /// Routes a gem's routing method draws that are left out (`ingest::gem_hooks::omits_on_failure`), at the call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gem_route_gaps: Vec<crate::diagnostic::Diagnostic>,
+    /// `RouteHelpers` methods a gem's load generates from its route tables (Devise's `new_session_path(resource_or_scope)`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_route_helpers: Vec<crate::dialect::MethodDef>,
     /// Pins from `config/importmap.rb`, expanded (each
     /// `pin_all_from` has been resolved into explicit per-file
     /// pins via `app/javascript/**` walking). Consumed by the
@@ -194,6 +213,13 @@ pub struct App {
     /// Empty when the app ships no `sig/` directory.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub rbs_signatures: HashMap<ClassId, HashMap<Symbol, Ty>>,
+    /// How the `sig/` sidecars and inline signatures behind
+    /// `rbs_signatures` spelled each class name (`crate::rbs::Spellings`).
+    /// Provenance only: the Ruby RBS writer reads it to keep a declared
+    /// name as written when its lexical nesting is preserved; identity
+    /// and every other reader use the ids.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rbs_spellings: crate::rbs::MethodSpellings,
     /// What a `sig/**/*.rbs` sidecar says a class INCLUDES, keyed by
     /// the declaring class and holding the module names as written.
     ///
@@ -365,11 +391,12 @@ pub struct App {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_adapter: Option<String>,
     /// The Redis the app's `Sidekiq.configure_client` block names
-    /// (`config.redis = { url: …, password: … }`), read at ingest from
-    /// `config/initializers`. It is the only source of where jobs are
-    /// pushed: a tree on `:sidekiq` without a `url:` here is an ingest
-    /// error, with no fallback to `REDIS_PROVIDER`, `REDIS_URL` or
-    /// localhost. Other keys are not read.
+    /// (`config.redis = { url: …, password: …, db: …, timeout: … }`),
+    /// read at ingest from `config/initializers`. It is the only source
+    /// of where jobs are pushed: a tree on `:sidekiq` without a `url:`
+    /// here is an ingest error, with no fallback to `REDIS_PROVIDER`,
+    /// `REDIS_URL` or localhost. A key it can't honor is an error on
+    /// `:sidekiq` (see `ingest::app::sidekiq_redis_key`).
     #[serde(default, skip_serializing_if = "SidekiqRedisConfig::is_empty")]
     pub sidekiq_redis: SidekiqRedisConfig,
     /// The worker's defaults from `config/sidekiq.yml` (concurrency,
@@ -407,10 +434,23 @@ pub struct App {
     /// (not a seeded `include` set on every model).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hook_class_macros: Vec<ClassId>,
+    /// The modules a model macro's body includes into the model (devise's
+    /// `devise :database_authenticatable`), written in the call's place
+    /// (`configured_superclass::expand_model_mixin_macros`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macro_includes: Vec<(ClassId, ClassId)>,
+    /// The model macro calls those includes took the place of, as written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_macro_calls: Vec<(ClassId, crate::expr::Expr)>,
     /// Modules `extend`ed inside `ActiveSupport.on_load(:active_record)`:
     /// their instance methods are class-method macros on every model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hook_extended_macros: Vec<ClassId>,
+    /// Constants written on ActiveRecord::Base inside `ActiveSupport.on_load(:active_record)` (`self::X = Const`,
+    /// orm_adapter's `self::OrmAdapter = ::OrmAdapter::ActiveRecord`): the name, the constant path it holds as written
+    /// (a leading empty segment when rooted), and the hook's lexical nesting outermost first, one full name per header.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_hook_constants: Vec<(Symbol, Vec<Symbol>, Vec<Symbol>)>,
     /// Class methods a model took from a module only it extends
     /// (`ingest::extend_splice`), by name.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
@@ -1289,20 +1329,25 @@ impl App {
             fixtures: Vec::new(),
             seeds: None,
             boot_program: Vec::new(),
+            gem_load_statements: Vec::new(),
+            gem_loaded_files: Default::default(),
             boot_gem_constants: Vec::new(),
             gem_middlewares: Vec::new(),
             gem_middleware_blocks: Default::default(),
+            gem_middleware_args: Default::default(),
             rack_env_writes: Default::default(),
             gem_middleware_refusals: Vec::new(),
             included_hoist_conflicts: Vec::new(),
             superclass_refusals: Vec::new(),
             gem_route_gaps: Vec::new(),
+            generated_route_helpers: Vec::new(),
             importmap: None,
             engine_importmaps: Vec::new(),
             inertia: None,
             vite_manifest: None,
             stylesheets: Vec::new(),
             rbs_signatures: HashMap::default(),
+            rbs_spellings: HashMap::default(),
             rbs_includes: HashMap::default(),
             gem_lock: None,
             loaded_frameworks: None,
@@ -1327,6 +1372,9 @@ impl App {
             pending_attachment_on_load: Vec::new(),
             load_hook_class_macros: Vec::new(),
             load_hook_extended_macros: Vec::new(),
+            load_hook_constants: Vec::new(),
+            macro_includes: Vec::new(),
+            expanded_macro_calls: Vec::new(),
             spliced_class_methods: Default::default(),
             time_tag_calls: Vec::new(),
             partial_local_types: HashMap::default(),
@@ -1401,7 +1449,7 @@ mod includer_guard_tests {
     use super::IncluderGuard;
 
     fn guard(classes: &[&str], negate: bool) -> IncluderGuard {
-        IncluderGuard { classes: classes.iter().map(|c| c.to_string()).collect(), negate }
+        IncluderGuard { classes: classes.iter().map(|c| c.to_string()).collect(), negate, asked: None }
     }
 
     #[test]
@@ -1426,18 +1474,58 @@ mod includer_guard_tests {
     }
 }
 
-/// `App::sidekiq_redis`: the `url:` and `password:` of the app's
-/// `Sidekiq.configure_client` Redis settings, each `None` when the block
-/// doesn't give it in a form ingest reads.
+/// `App::sidekiq_redis`: the app's `Sidekiq.configure_client` Redis
+/// settings that the push and the worker honor, each `None` when the
+/// block doesn't give it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SidekiqRedisConfig {
     pub url: Option<RedisSetting>,
     pub password: Option<RedisSetting>,
+    /// `username:`, the Redis 6 ACL user. It overrides the URL's, as
+    /// `password:` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<RedisSetting>,
+    /// `db:`, which overrides the URL's database. An Integer literal is
+    /// held as its digits; a variable is read, and checked to be an
+    /// Integer, when the push first connects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db: Option<RedisSetting>,
+    /// `timeout:` (or Sidekiq's `network_timeout:`), the default for the
+    /// two below. Sidekiq passes 3 seconds when the app gives none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_timeout: Option<f64>,
+    /// `reconnect_attempts:` as redis-client reads it: one delay, in
+    /// seconds, per retry after a connection error. An Integer `n` is `n`
+    /// zero delays and `false` is none. Sidekiq passes 1 when the app
+    /// gives none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_attempts: Option<Vec<f64>>,
 }
 
 impl SidekiqRedisConfig {
     pub fn is_empty(&self) -> bool {
-        self.url.is_none() && self.password.is_none()
+        *self == Self::default()
+    }
+
+    /// Sidekiq 8.1.7's `RedisConnection.create` sets `timeout ||= 3`
+    /// before redis-client reads it, and `network_timeout:` replaces it.
+    pub const SIDEKIQ_TIMEOUT: f64 = 3.0;
+
+    pub fn effective_connect_timeout(&self) -> f64 {
+        self.connect_timeout.or(self.timeout).unwrap_or(Self::SIDEKIQ_TIMEOUT)
+    }
+
+    pub fn effective_read_timeout(&self) -> f64 {
+        self.read_timeout.or(self.timeout).unwrap_or(Self::SIDEKIQ_TIMEOUT)
+    }
+
+    /// Sidekiq's `reconnect_attempts ||= 1`: one retry, without a wait.
+    pub fn effective_reconnect_delays(&self) -> Vec<f64> {
+        self.reconnect_attempts.clone().unwrap_or_else(|| vec![0.0])
     }
 }
 

@@ -154,6 +154,9 @@ fn program_items(
                 modules.insert(name.clone());
                 found.push((m.location().start_offset(), name));
             }
+            // A class a namespace body makes by assignment (Doorkeeper's `AccessDenied = Class.new(BaseResponseError)`
+            // in `module Errors`), where Ruby makes it, not with the app's files.
+            found.extend(nested_constant_writes(&stmt));
             found.sort_by_key(|(start, _)| *start);
             let mut names: Vec<ClassId> = Vec::new();
             for (_, name) in found {
@@ -172,11 +175,27 @@ fn program_items(
             if !opened.is_empty() {
                 items.push(ProgramItem::Opened(opened));
             }
+            let mut loads = Vec::new();
+            body_requires(&stmt, &[], file, list_dir, &span_of, &mut loads);
+            // A module's autoloads go ahead of its declaration: its body can read them as it loads (simple_form's
+            // `wrappers` reads `Wrappers::Leaf`), and registering one early is lazy. Not a class's: opening it ahead
+            // of the declaration would drop its superclass.
+            let chains = nestings(&stmt);
+            let joined = |chain: &Vec<(String, bool)>| chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
+            let modules_only: Vec<String> = chains.iter().filter(|chain| chain.iter().all(|(_, is_class)| !is_class)).map(joined).collect();
+            let opened: Vec<String> = chains.iter().map(joined).collect();
+            // Nor one of a constant the statement opens itself (Doorkeeper's `autoload :Client, …` then `class Client`):
+            // Ruby runs that autoload at the `class`, and the emitted declaration reopening it would run the program
+            // that drops the very autoload it is reopening under.
+            let (early, late): (Vec<_>, Vec<_>) = loads.into_iter().partition(|item| {
+                matches!(item, ProgramItem::Autoload { owner, name, .. } if modules_only.contains(owner) && !opened.contains(&format!("{owner}::{name}")))
+            });
+            items.extend(early);
             if !names.is_empty() {
                 items.push(ProgramItem::Declared(names));
             }
-            // What the bodies require and autoload as they load, after them.
-            body_requires(&stmt, &[], file, list_dir, &span_of, &mut items);
+            // What the bodies require as they load, after them.
+            items.extend(late);
             continue;
         }
         // A constant rides with the file's classes (`carry_file_constants`).
@@ -636,6 +655,33 @@ fn nestings(stmt: &ruby_prism::Node<'_>) -> Vec<Vec<(String, bool)>> {
     out
 }
 
+/// Each `Name = …` a class or module body of `stmt` writes, as its full name, with where it starts.
+fn nested_constant_writes(stmt: &ruby_prism::Node<'_>) -> Vec<(usize, String)> {
+    fn walk(node: &ruby_prism::Node<'_>, outer: &[String], out: &mut Vec<(usize, String)>) {
+        let (path, body) = if let Some(c) = node.as_class_node() {
+            (class_name_path(&c), c.body())
+        } else if let Some(m) = node.as_module_node() {
+            (module_name_path(&m), m.body())
+        } else {
+            return;
+        };
+        let Some(path) = path else { return };
+        let mut scope = outer.to_vec();
+        scope.extend(path);
+        let Some(statements) = body.as_ref().and_then(|b| b.as_statements_node()) else { return };
+        for inner in statements.body().iter() {
+            if let Some(write) = inner.as_constant_write_node() {
+                let name = scope.iter().map(String::as_str).chain(std::iter::once(constant_id_str(&write.name()).as_ref())).collect::<Vec<_>>().join("::");
+                out.push((write.location().start_offset(), name));
+            }
+            walk(&inner, &scope, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(stmt, &[], &mut out);
+    out
+}
+
 /// `ActiveSupport.on_load(…) { … }`.
 fn is_on_load(stmt: &ruby_prism::Node<'_>) -> bool {
     stmt.as_call_node().is_some_and(|call| {
@@ -690,7 +736,7 @@ fn derived_autoload(stmt: &ruby_prism::Node<'_>) -> Option<String> {
 
 /// `require "x"` / `require_relative "x"` of a string literal, as
 /// `(feature, relative)`.
-fn literal_require(call: &ruby_prism::CallNode<'_>) -> Option<(String, bool)> {
+pub(super) fn literal_require(call: &ruby_prism::CallNode<'_>) -> Option<(String, bool)> {
     let name = constant_id_str(&call.name());
     if call.receiver().is_some() || call.block().is_some() || !matches!(name, "require" | "require_relative") {
         return None;
@@ -792,7 +838,7 @@ fn declares_inside(stmt: &ruby_prism::Node<'_>) -> bool {
 /// The literal `require "x"` features a file runs as it loads: at its
 /// top level and in its class and module bodies (not in a method). For
 /// an app file, whose requires of a gem's files load that gem at boot.
-pub(super) fn literal_requires(source: &[u8], file: &str) -> Vec<String> {
+pub(super) fn literal_requires(source: &[u8], _file: &str) -> Vec<String> {
     fn walk(statements: &[ruby_prism::Node<'_>], out: &mut Vec<String>) {
         for stmt in statements {
             if let Some((feature, false)) = stmt.as_call_node().and_then(|c| literal_require(&c)) {
@@ -809,7 +855,7 @@ pub(super) fn literal_requires(source: &[u8], file: &str) -> Vec<String> {
             }
         }
     }
-    let result = super::prism::parse(source, file);
+    let result = super::prism::parse_silent(source);
     let root = result.node();
     let Some(program) = root.as_program_node() else { return Vec::new() };
     let statements: Vec<ruby_prism::Node<'_>> = program.statements().body().iter().collect();
@@ -821,6 +867,13 @@ pub(super) fn literal_requires(source: &[u8], file: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::is_zeitwerk;
+
+    #[test]
+    fn literal_requires_does_not_repeat_parse_diagnostics() {
+        let (features, diagnostics) = super::super::prism::scope(|| super::literal_requires(b"require \"stringio\"\n)\n", "broken.rb"));
+        assert_eq!(features, ["stringio"]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
 
     fn setup_statements(source: &str) -> Vec<bool> {
         let parsed = super::super::prism::parse_silent(source.as_bytes());
@@ -843,4 +896,37 @@ mod tests {
         );
         assert_eq!(read, vec![true, true, true, true, false, false, true]);
     }
+}
+
+/// A gem file's path with `.` and `..` segments folded, as programs and sources are keyed.
+pub(crate) fn normalize_source(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "." => {}
+            ".." if out.last().is_some_and(|s| !s.is_empty() && *s != "..") => {
+                out.pop();
+            }
+            _ => out.push(segment),
+        }
+    }
+    out.join("/")
+}
+
+/// The carried file a gem file's `require` (or `require_relative`) of `feature` loads, among `known`.
+pub(crate) fn resolve_gem_require(known: &crate::det::HashSet<String>, from: &str, feature: &str, relative: bool) -> Option<String> {
+    let file = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
+    if relative {
+        let dir = std::path::Path::new(from).parent()?;
+        return Some(normalize_source(&dir.join(&file).display().to_string()));
+    }
+    let lib_of = |path: &str| path.rfind("/lib/").map(|at| path[..at + 5].to_string());
+    let own = lib_of(from).map(|lib| normalize_source(&format!("{lib}{file}")));
+    if let Some(own) = own.filter(|p| known.contains(p)) {
+        return Some(own);
+    }
+    let suffix = format!("/lib/{file}");
+    let mut found: Vec<&String> = known.iter().filter(|p| p.ends_with(&suffix)).collect();
+    found.sort();
+    found.first().map(|p| p.to_string())
 }

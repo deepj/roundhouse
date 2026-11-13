@@ -33,7 +33,9 @@ use super::library_class::{
 };
 use super::model::ingest_model_with_enum_constants;
 use super::routes::{EngineRouteSource, RouteHelperSource, ingest_route_file, merge_route_files};
-use super::schema::{ingest_migration, ingest_schema};
+use super::schema::{
+    ingest_migration_with_generated_expression_dialect, ingest_schema_with_generated_expression_dialect,
+};
 use super::structure_sql::ingest_structure_sql;
 use super::test::{ingest_test_bases, ingest_test_files};
 use super::view::{ViewEngine, ingest_template};
@@ -607,6 +609,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         let mut app = match ingest_rails_app(vfs, dir, &auto) {
             Ok(app) => app,
             Err(err) => {
+                let site = super::error_site::of(&err);
+                let source = match &err {
+                    IngestError::Unsupported { file, .. } => super::sources::text_of(file), _ => None,
+                };
                 let strict = super::prism::mark();
                 // Not the strict pass's first refusal as the answer: it can be a gem's DSL (`devise_for`) that only the gem's source, which this pass has not read yet, defines.
                 let more: Vec<String> = super::concern_accessors::not_deferring(|| super::survey::surveying(|| {
@@ -617,6 +623,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 .collect();
                 if more.is_empty() || auto.len() >= 32 {
                     super::prism::rewind(strict);
+                    if let (Some(source), IngestError::Unsupported { file, .. }) = (source, &err) {
+                        super::sources::register(file, &source);
+                    }
+                    if let Some((start, end)) = site { super::error_site::note(&err, start, end); }
                     return Err(err);
                 }
                 super::prism::rewind(marks.1);
@@ -698,7 +708,8 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     }
     // One walk of an unchanging tree: remember what each path answered.
     let cached_vfs = crate::vfs::CachedVfs::new(vfs);
-    let mount_vfs = super::source_gems::MountVfs { inner: &cached_vfs, gems: &source_gems };
+    let framework_libs = super::source_gems::framework_libs(vfs, dir, lock.as_ref());
+    let mount_vfs = super::source_gems::MountVfs { inner: &cached_vfs, gems: &source_gems, framework_libs: &framework_libs };
     let mut path_gems = path_gem_dirs(&mount_vfs, dir);
     path_gems.extend(source_gems.iter().map(|gem| gem.mount.clone()));
     let source_vfs = PathGemVfs::new(&mount_vfs, dir, &path_gems);
@@ -744,6 +755,8 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     let gem_libs: Vec<PathBuf> = source_gems.iter().map(|gem| gem.mount.join("lib")).collect();
     let stack = super::railtie_middleware::read(vfs, dir, &gem_libs);
     let stacked_application_uses = stack.application_taken;
+    let middleware_loops = stack.loops;
+    let env_writes_by_class = stack.env_writes_by_class;
     (app.gem_middlewares, app.gem_middleware_blocks, app.rack_env_writes, app.gem_middleware_refusals) =
         (stack.classes, stack.blocks, stack.env_writes, stack.diags);
     // `enum` columns declared inside a concern's `included do`, keyed by
@@ -789,10 +802,11 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
 
     let schema_path = dir.join("db/schema.rb");
     let structure_path = dir.join("db/structure.sql");
+    let expression_dialect = schema_expression_dialect(vfs, dir);
     if vfs.exists(&schema_path) {
         if let Some(source) = read_or_ledger(vfs, &schema_path)? {
             if let Some(schema) =
-                unwrap_or_record(ingest_schema(&source, &schema_path.display().to_string()))?
+                unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &schema_path.display().to_string(), expression_dialect))?
             {
                 app.schema = schema;
             }
@@ -850,20 +864,22 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             let mut schema = crate::schema::Schema::default();
             for entry in files {
                 let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
-                unwrap_or_record(ingest_migration(
+                unwrap_or_record(ingest_migration_with_generated_expression_dialect(
                     &source,
                     &entry.display().to_string(),
                     &mut schema,
+                    expression_dialect,
                 ))?;
             }
             app.schema = schema;
         }
     }
+    app.schema.expression_dialect = expression_dialect;
     // Not its own database: the runtime opens only the primary, so solid_queue's tables join it.
     if solid_queue_root.is_some() && vfs.exists(&dir.join("db/queue_schema.rb")) {
         let queue_schema = dir.join("db/queue_schema.rb");
         if let Some(source) = read_or_ledger(vfs, &queue_schema)? {
-            if let Some(queue) = unwrap_or_record(ingest_schema(&source, &queue_schema.display().to_string()))? {
+            if let Some(queue) = unwrap_or_record(ingest_schema_with_generated_expression_dialect(&source, &queue_schema.display().to_string(), expression_dialect))? {
                 for (name, table) in queue.tables {
                     app.schema.tables.entry(name).or_insert(table);
                 }
@@ -1303,6 +1319,23 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
                             }
                         }
                     }
+                    // Not a gem's `lib/` alone: its `app/` holds them too (devise's `if defined?(ActionMailer)
+                    // class Devise::Mailer …`), which no program loads but Rails' autoload.
+                    let in_gem_app = path_gems.iter().any(|gem| entry.starts_with(gem.join("app")));
+                    if in_gem_app && !gem_libs.iter().any(|lib| entry.starts_with(lib)) {
+                        let (branched, branch_aliases) = super::inherited_alias::capturing(|| {
+                            super::library_class::ingest_file_branch_classes(&source, &path_str)
+                        });
+                        for span in branch_aliases {
+                            if !aliases.contains(&span) {
+                                aliases.push(span);
+                            }
+                        }
+                        if let Ok(branched) = branched {
+                            let branched: Vec<_> = branched.into_iter().filter(|m| !classes.iter().any(|c| c.name == m.name)).collect();
+                            classes.extend(branched);
+                        }
+                    }
                     if gem_libs.iter().any(|lib| entry.starts_with(lib)) {
                         let (branched, branch_aliases) = super::inherited_alias::capturing(|| {
                             super::library_class::ingest_file_branch_classes(&source, &path_str)
@@ -1481,8 +1514,14 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
     app.active_job_retry_jitter = read_active_job_retry_jitter(vfs, dir);
     // The ActiveJob queue adapter (see `App::queue_adapter`).
     app.queue_adapter = read_queue_adapter(vfs, dir);
+    // Retain recurring declarations for payload refusal locations.
+    let recurring = dir.join("config/recurring.yml");
+    if let Ok(text) = vfs.read_to_string(&recurring) {
+        super::sources::register(&recurring.display().to_string(), &text);
+    }
     // Where Sidekiq pushes (see `App::sidekiq_redis`).
-    app.sidekiq_redis = read_sidekiq_redis(vfs, dir);
+    let (sidekiq_redis, sidekiq_redis_refused) = read_sidekiq_redis(vfs, dir);
+    app.sidekiq_redis = sidekiq_redis;
     // The worker's defaults (see `App::sidekiq_worker`).
     let (worker_defaults, worker_warnings) = super::sidekiq_yml::read(vfs, dir);
     app.sidekiq_worker = worker_defaults;
@@ -2868,7 +2907,8 @@ end
                 }
                 let Some(source) = read_to_string_or_ledger(vfs, &entry)? else { continue };
                 let path_str = entry.display().to_string();
-                let parsed = crate::rbs::parse_app_signatures(&source).map_err(|message| {
+                let (parsed, spellings) = crate::rbs::collect_spellings(|| crate::rbs::parse_app_signatures(&source));
+                let parsed = parsed.map_err(|message| {
                     IngestError::Parse {
                         file: path_str.clone(),
                         message,
@@ -2880,6 +2920,9 @@ end
                             .entry(class_id)
                             .or_default()
                             .extend(methods);
+                    }
+                    for (class_id, methods) in spellings {
+                        app.rbs_spellings.entry(class_id).or_default().extend(methods);
                     }
                 }
                 // The same file's `include`s. A gem's base class is
@@ -2925,6 +2968,8 @@ end
     // because it is written for this analyzer while a `sig` is written
     // for Sorbet. A `sig` outside the grammar the reader models is
     // dropped whole and the method is inferred as before.
+    let external_methods: HashSet<_> = app.rbs_signatures.iter()
+        .flat_map(|(owner, methods)| methods.keys().map(move |name| (owner.clone(), name.clone()))).collect();
     for root in ["app", "lib"] {
         let tree = dir.join(root);
         if !vfs.is_dir(&tree) {
@@ -2933,12 +2978,25 @@ end
         let Ok(entries) = read_rb_files(vfs, &tree) else { continue };
         for entry in entries {
             let Ok(source) = vfs.read(&entry) else { continue };
-            let (signatures, abstracts) = super::sorbet_sig::ingest_sorbet_declarations(&source);
+            let ((signatures, abstracts), spellings) =
+                crate::rbs::collect_spellings(|| super::sorbet_sig::ingest_sorbet_declarations(&source));
             drop_abstract_stubs(&mut app, &abstracts);
-            for (class_id, methods) in signatures {
-                let declared = app.rbs_signatures.entry(class_id).or_default();
+            for (class_id, methods) in &signatures {
+                let declared = app.rbs_signatures.entry(class_id.clone()).or_default();
                 for (name, ty) in methods {
-                    declared.entry(name).or_insert(ty);
+                    declared.entry(name.clone()).or_insert_with(|| ty.clone());
+                }
+            }
+            // Provenance follows definitions, even when the shared signature
+            // table keeps an earlier seed. Sidecars and façades still win.
+            for (class_id, methods) in spellings {
+                for (name, mut spelled) in methods {
+                    if external_methods.contains(&(class_id.clone(), name.clone())) { continue; }
+                    let current = signatures.get(&class_id).and_then(|m| m.get(&name));
+                    let selected = app.rbs_signatures.get(&class_id).and_then(|m| m.get(&name));
+                    if selected.is_none() { continue; }
+                    if current != selected { spelled.clear(); }
+                    app.rbs_spellings.entry(class_id.clone()).or_default().insert(name, spelled);
                 }
             }
         }
@@ -2956,7 +3014,12 @@ end
     let (rate_limit_stores, rate_limit_store_values) = super::rate_limit::install_boot_stores(&mut app, rate_limit_stores, &const_resolver.for_sources(&sources));
     if app.queue_adapter.as_deref() == Some("sidekiq") {
         sidekiq_warnings.into_iter().for_each(warn_sidekiq);
+        sidekiq_redis_refused.into_iter().for_each(refuse_sidekiq);
         require_sidekiq_redis_url(&app);
+    } else {
+        // Off :sidekiq the settings reach no client, so these stay
+        // warnings, as the ignored keys are.
+        sidekiq_redis_refused.into_iter().for_each(warn_sidekiq);
     }
     if app.queue_adapter.as_deref() == Some("sidekiq") && app.cable_redis.is_none() {
         warn_sidekiq(format!(
@@ -3063,6 +3126,15 @@ end
     // `Ns::BaseController`; `include Avatar` inside `class User` names
     // `User::Avatar`. The passes above leave both as written.
     super::written_names::resolve(&mut app, &sources, &const_resolver.for_sources(&sources));
+    // Before the concern splices: what a `ClassMethods` body's call defines is copied onto the includers with the rest.
+    for (owner, span) in super::configured_superclass::expand_load_time_definers(&mut app, &sources) {
+        if let Some(carrier) = concern_class_method_spans.iter_mut().find(|c| c.owner == owner) {
+            carrier.methods.push(span);
+        }
+        app.concern_class_side_spans.insert(span);
+    }
+    // After the definers: a hook the macro runs reads what they define (Validatable's `email_regexp`).
+    super::configured_superclass::expand_model_mixin_macros(vfs, dir, &path_gems, &mut app);
     // Before the concern splices: they read `library_classes`, and this
     // turns `Current`'s metaprogrammed surface into real methods first.
     super::current_attributes::lower_current_attributes(&mut app);
@@ -3194,15 +3266,18 @@ end
     // After the macros: a configured object's readers and its builder's writers are methods by now.
     super::configured_superclass::fold(vfs, dir, &mut app);
     super::configured_superclass::fold_class_names(vfs, dir, &mut app);
+    super::configured_superclass::fold_middleware_loops(vfs, dir, &mut app, middleware_loops, &env_writes_by_class);
     super::gem_routes::expand(vfs, dir, &path_gems, &mut app);
     super::class_macros::drop_expanded_hook_macros(&mut app, &hook_macros_called, &mentions);
+    super::extend_splice::splice_load_hook_extended_calls(&mut app);
     super::model_callbacks::expand_model_callbacks(&mut app);
     // After the macros: an expanded `has_ancestry` is what writes the `extend`.
     super::extend_splice::splice_sole_extended_modules(&mut app);
     super::included_extend::splice_included_extends(&mut app);
+    super::metal_actions::synthesize(&mut app);
     super::absence_guards::raise_undefined_capitalized_calls(&mut app);
     // Not asked at `absence_guards::mark`: by then a source gem's methods no longer resolve their file.
-    let source_gem_classes = super::absence_guards::source_gem_classes(&app);
+    let source_gem_code = super::absence_guards::source_gem_code(&app);
     super::column_accessors::rewrite_super(&mut app);
     // After the splice, so a class method a concern contributed gets
     // the same treatment as one written in the model.
@@ -3240,12 +3315,15 @@ end
     refuse_unread_concern_filters(&app)?;
     drop_modelled_included_hooks(&mut app);
     splice_concerns_into_controllers(&mut app);
+    // After the splice: a concern's filter reads the key as the controller's own body does.
+    crate::lower::primary_key_send::rewrite_guarded(&mut app);
     // After the splice: an action a concern provides is not implicit.
     synthesize_template_only_actions(&mut app);
     // After the splice: a macro has to resolve against the concern's
     // class-side methods, and its expansion joins the same filter chain.
     super::class_configuration::expand(&mut app, &concern_class_method_spans, &framework_shadow_scopes)?;
     super::class_attribute::expand(&mut app, &concern_class_method_spans, &framework_shadow_scopes);
+    super::controller_class_methods::splice(&mut app, &concern_class_method_spans);
     expand_class_body_macros(&mut app)?;
     // After the splice: a guard constant may live on an ancestor or arrive with a concern.
     super::caches_page::expand(&mut app);
@@ -3297,6 +3375,11 @@ end
     // `numericality:` on an untyped attribute is decided per target
     // (`refuse_numericality_allow_on_untyped`, `session::analyze_and_lower_for`).
     gap_acceptance_on_undeclared(&mut app);
+    define_confirmation_accessors(&mut app);
+    crate::lower::for_each_hook_body(&mut app, &mut drop_discarded_permits);
+    super::built_send::devirtualize(&mut app);
+    super::built_send::devirtualize_param_sends(&mut app);
+    record_mixin_sends(&mut app);
     // Not at model ingest: the `select` naming a model's aliases can sit in another model, class, controller or view.
     super::select_aliases::stamp(&mut app);
     gap_uniqueness_on_polymorphic_attribute(&mut app);
@@ -3354,27 +3437,44 @@ end
     // Before the body statements, which ask whether a class-side writer
     // the class body writes through is defined.
     super::hook_class_attribute::expand(&mut app);
+    super::aliased_includes::resolve(&mut app);
+    // Between the two: a class body's `respond_to?(:status=)` asks for the writers just made, and the settled branch's writes join the body statements.
+    super::settled_conditionals::settle(&mut app);
     super::app_extension_calls::mark(&mut app);
     super::body_statements::mark(&mut app);
     report_unmodelled_records(&app);
     super::unreached_gem_modules::drop(&mut app, dir);
+    super::gem_load_program::carry(&mut app);
     super::interpolated_renders::expand(&mut app);
     super::controller_delegates::expand(&mut app);
     super::active_model_super::rewrite(&mut app);
     super::queue_adapter_reader::synthesize(&mut app);
     super::container_specialize::specialize(&mut app);
     super::unreachable_views::mark(&mut app);
+    mime_extension_lookups(&mut app);
+    super::option_merger::expand(&mut app);
     for d in crate::controller_layout::diagnostics(&app.controllers, &app.views) {
         super::prism::push(d);
     }
-    super::settled_conditionals::settle(&mut app);
     // Not beside the hoists: later passes give an included module methods and ancestors (forwardable, carried includes, props bases, the queue adapter reader) or take an inactive branch's away.
     app.included_hoist_conflicts = super::library_class::included_hoist_conflicts(&app.library_classes);
     // Here, once later passes stop giving modules methods: a concern's `to_param` before analysis types it on the model.
     splice_concern_to_param_into_includers(&mut app);
     super::job_class_lookup::rewrite(&mut app);
     super::uncalled_definers::mark(&mut app);
-    super::absence_guards::mark(&mut app, &source_gem_classes);
+    // A feature an installed locked gem ships as `lib/<feature>.rb`, whatever the gem's name or namespace.
+    let locked_gem_libs: Vec<PathBuf> = {
+        let roots = crate::i18n::gems::gem_roots(vfs, dir);
+        app.gem_lock
+            .iter()
+            .flat_map(|lock| lock.specs.iter())
+            .filter_map(|(name, version)| crate::i18n::gems::installed_gem(vfs, &roots, name, version))
+            .chain(path_gems.iter().cloned())
+            .map(|gem| gem.join("lib"))
+            .collect()
+    };
+    let shipped = |feature: &str| locked_gem_libs.iter().any(|lib| vfs.exists(&lib.join(format!("{feature}.rb"))));
+    super::absence_guards::mark(&mut app, &source_gem_code, &shipped);
     // After every pass that changes a controller's methods, the concern
     // splice and the class-body macros above all: the lowering clones
     // from the controller they leave.
@@ -3497,7 +3597,7 @@ fn report_unmodelled_records(app: &App) {
     }
 }
 
-const APP_REQUIRABLE_STDLIB: &[&str] = &[
+pub(crate) const APP_REQUIRABLE_STDLIB: &[&str] = &[
     "base64", "benchmark", "bigdecimal", "cgi", "csv", "date", "delegate", "digest",
     "digest/md5", "digest/sha1", "digest/sha2", "English", "erb", "etc", "fileutils", "find",
     "forwardable", "io/console", "io/nonblock", "io/wait", "ipaddr", "json", "logger",
@@ -3506,8 +3606,8 @@ const APP_REQUIRABLE_STDLIB: &[&str] = &[
     "strscan", "tempfile", "time", "timeout", "tmpdir", "uri", "weakref", "yaml", "zlib",
 ];
 
-/// [`App::app_requires`]: every literal top-level `require "lib"` of a
-/// standard library in the ingested Ruby sources under the app and
+/// [`App::app_requires`]: every literal `require "lib"` at file level or
+/// in a class or module body for a standard library under the app and
 /// support roots, including files loaded by the boot chain. A terminal
 /// channel that requires `pty` and `io/console` needs the second for `IO#winsize=`,
 /// which io/console adds and no constant names, so the bundled requires
@@ -3521,21 +3621,8 @@ fn collect_app_requires(sources: &[crate::span::SourceFile], roots: &[PathBuf]) 
         {
             continue;
         }
-        for line in source.text.lines() {
-            let Some(rest) = line.strip_prefix("require ") else { continue };
-            // `require "io/console" # why`: the literal, then nothing but
-            // a comment
-            let rest = rest.trim_start();
-            let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
-            let Some(end) = rest[1..].find(q) else { continue };
-            let after = rest[end + 2..].trim_start();
-            let quoted = (after.is_empty() || after.starts_with('#')).then(|| &rest[1..end + 1]);
-            if let Some(lib) = quoted {
-                if APP_REQUIRABLE_STDLIB.contains(&lib) {
-                    out.insert(lib.to_string());
-                }
-            }
-        }
+        out.extend(super::file_program::literal_requires(source.text.as_bytes(), &source.path)
+            .into_iter().filter(|lib| APP_REQUIRABLE_STDLIB.contains(&lib.as_str())));
     }
     out.into_iter().collect()
 }
@@ -3656,7 +3743,7 @@ pub(crate) fn refuse_numericality_allow_on_untyped(app: &mut App, target: &str) 
 /// Rails casts it (`true` is `"t"` on a String attribute). Refused as a
 /// whole call, as the numericality gap is.
 fn gap_acceptance_on_undeclared(app: &mut App) {
-    use crate::dialect::{MethodReceiver, ModelBodyItem, ValidationRule};
+    use crate::dialect::{ModelBodyItem, ValidationRule};
     use crate::expr::{ExprNode, Literal};
     let mut attribute_api: Vec<(crate::span::Span, String)> = Vec::new();
     for model in &mut app.models {
@@ -3669,26 +3756,7 @@ fn gap_acceptance_on_undeclared(app: &mut App) {
                 _ => false,
             })
         };
-        let declared = |attr: &crate::ident::Symbol| {
-            let setter = crate::ident::Symbol::from(format!("{}=", attr.as_str()));
-            model.attributes.fields.contains_key(attr)
-                || model.body.iter().any(|item| match item {
-                    ModelBodyItem::Method { method, .. } => {
-                        method.receiver == MethodReceiver::Instance && (method.name == *attr || method.name == setter)
-                    }
-                    ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
-                        ExprNode::Send { recv: None, method, args, .. }
-                            if matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer") =>
-                        {
-                            args.iter().any(|arg| {
-                                matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr)
-                            })
-                        }
-                        _ => false,
-                    },
-                    _ => false,
-                })
-        };
+        let declared = |attr: &crate::ident::Symbol| model_declares_attr(model, attr);
         let mut refused_attribute_api: Vec<(usize, crate::span::Span, String)> = Vec::new();
         let mut virtual_attrs: Vec<(usize, crate::ident::Symbol, crate::span::Span)> = Vec::new();
         for (i, item) in model.body.iter().enumerate() {
@@ -3735,6 +3803,181 @@ fn gap_acceptance_on_undeclared(app: &mut App) {
         attribute_api,
         "acceptance: on an `attribute` the model declares, whose writer stores the input uncast where Rails casts it",
     );
+}
+
+/// A column, an `attr_*` or an instance method of the model names `attr` (or its writer).
+fn model_declares_attr(model: &crate::dialect::Model, attr: &crate::ident::Symbol) -> bool {
+    model_declares_side(model, attr, true) || model_declares_side(model, attr, false)
+}
+
+/// The model answers `attr` (`reader`) or `attr=` itself: a column, its own `def`, or the `attr_*` that defines that side.
+fn model_declares_side(model: &crate::dialect::Model, attr: &crate::ident::Symbol, reader: bool) -> bool {
+    use crate::dialect::{MethodReceiver, ModelBodyItem};
+    use crate::expr::{ExprNode, Literal};
+    let name = if reader { attr.clone() } else { crate::ident::Symbol::from(format!("{}=", attr.as_str())) };
+    let macros: &[&str] = if reader { &["attr_accessor", "attr_reader"] } else { &["attr_accessor", "attr_writer"] };
+    model.attributes.fields.contains_key(attr)
+        || model.body.iter().any(|item| match item {
+            ModelBodyItem::Method { method, .. } => method.receiver == MethodReceiver::Instance && method.name == name,
+            ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
+                ExprNode::Send { recv: None, method, args, .. } if macros.contains(&method.as_str()) => {
+                    args.iter().any(|arg| matches!(&*arg.node, ExprNode::Lit { value: Literal::Sym { value } } if value == attr))
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+}
+
+/// The module `written` names in `from`'s body: looked up from `from`'s namespace outward, then as written.
+fn lexical_module(app: &App, from: &crate::ident::ClassId, written: &crate::ident::ClassId) -> crate::ident::ClassId {
+    let name = written.0.as_str();
+    if let Some(top) = name.strip_prefix("::") {
+        return crate::ident::ClassId(crate::ident::Symbol::from(top));
+    }
+    let mut scope = Some(from.0.as_str());
+    while let Some(prefix) = scope {
+        let candidate = format!("{prefix}::{name}");
+        if app.library_classes.iter().any(|c| c.name.0.as_str() == candidate) {
+            return crate::ident::ClassId(crate::ident::Symbol::from(candidate.as_str()));
+        }
+        scope = prefix.rsplit_once("::").map(|(p, _)| p);
+    }
+    written.clone()
+}
+
+/// `confirmation:` on `attr`: Rails' `ConfirmationValidator#setup!` defines a plain `<attr>_confirmation` reader and
+/// writer where the model has none, so the model gains that `attr_accessor`, ahead of the validation.
+fn define_confirmation_accessors(app: &mut App) {
+    use crate::dialect::{ModelBodyItem, ValidationRule};
+    use crate::expr::{ExprNode, Literal};
+    // What the modules each model includes define, which Ruby's `method_defined?` counts as the model's.
+    let mixed_in: Vec<crate::det::HashSet<crate::ident::Symbol>> = app
+        .models
+        .iter()
+        .map(|model| {
+            let mut out = crate::det::HashSet::default();
+            let mut pending = crate::analyze::model_includes(model);
+            let mut seen = crate::det::HashSet::default();
+            while let Some(id) = pending.pop() {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                for lc in app.library_classes.iter().filter(|c| c.name == id) {
+                    out.extend(lc.methods.iter().filter(|m| m.receiver == crate::dialect::MethodReceiver::Instance).map(|m| m.name.clone()));
+                    // Not as written: a module includes a sibling by its short name, which names it from its own namespace outward.
+                    pending.extend(lc.includes.iter().map(|written| lexical_module(app, &lc.name, written)));
+                }
+            }
+            out
+        })
+        .collect();
+    for (model, mixed_in) in app.models.iter_mut().zip(mixed_in) {
+        let mut wanted: Vec<(usize, crate::ident::Symbol, crate::span::Span, &'static str)> = Vec::new();
+        for (i, item) in model.body.iter().enumerate() {
+            let ModelBodyItem::Validation { validation, .. } = item else { continue };
+            if !validation.rules.iter().any(|rule| matches!(rule, ValidationRule::Confirmation { .. })) {
+                continue;
+            }
+            let name = crate::ident::Symbol::from(format!("{}_confirmation", validation.attribute.as_str()));
+            if wanted.iter().any(|(_, n, _, _)| *n == name) {
+                continue;
+            }
+            // Each side on its own, as `setup!` asks `method_defined?` of the reader and of the writer.
+            let writer = crate::ident::Symbol::from(format!("{}=", name.as_str()));
+            let reader_declared = model_declares_side(model, &name, true) || mixed_in.contains(&name);
+            let writer_declared = model_declares_side(model, &name, false) || mixed_in.contains(&writer);
+            let macro_name = match (reader_declared, writer_declared) {
+                (true, true) => continue,
+                (true, false) => "attr_writer",
+                (false, true) => "attr_reader",
+                (false, false) => "attr_accessor",
+            };
+            wanted.push((i, name, item.span(), macro_name));
+        }
+        for (i, name, span, macro_name) in wanted.into_iter().rev() {
+            let accessor = crate::expr::Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: None,
+                    method: crate::ident::Symbol::from(macro_name),
+                    args: vec![crate::expr::Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: name } })],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            model.body.insert(i, ModelBodyItem::Unknown { expr: accessor, leading_comments: Vec::new(), leading_blank_line: false });
+        }
+    }
+}
+
+/// `attributes.try(:permit!)` as a statement (Devise's `find_or_initialize_with_errors`): it only marks Parameters
+/// permitted, and a request's params reach the emitted program as plain Hashes whose permits are already identities
+/// (`lower::params_permit`), so on every value it can hold it does nothing the program reads.
+fn drop_discarded_permits(body: &mut crate::expr::Expr) {
+    use crate::expr::{ExprNode, Literal};
+    body.node.for_each_child_mut(&mut drop_discarded_permits);
+    let ExprNode::Seq { exprs } = &mut *body.node else { return };
+    let last = exprs.len().saturating_sub(1);
+    let mut i = 0;
+    exprs.retain(|e| {
+        let keep = i == last
+            || !matches!(&*e.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                if method.as_str() == "try"
+                    && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "permit!"))
+                    && matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. }));
+        i += 1;
+        keep
+    });
+}
+
+/// Each model's [`crate::dialect::Model::mixin_sends`]: the Dirty spellings the instance methods of the modules it
+/// includes send, through the modules those include.
+fn record_mixin_sends(app: &mut App) {
+    use crate::dialect::MethodReceiver;
+    use crate::expr::{Expr, ExprNode};
+    fn walk(e: &Expr, out: &mut crate::det::HashSet<crate::ident::Symbol>) {
+        match &*e.node {
+            ExprNode::Send { method, .. } => {
+                out.insert(method.clone());
+            }
+            // A name sent by its Symbol (`public_send(:email_changed?)`) demands the method as a spelled call does.
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => {
+                out.insert(value.clone());
+            }
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| walk(c, out));
+    }
+    let modules: HashMap<&crate::ident::ClassId, Vec<&crate::dialect::LibraryClass>> =
+        app.library_classes.iter().filter(|c| c.is_module).fold(HashMap::default(), |mut by, c| {
+            by.entry(&c.name).or_default().push(c);
+            by
+        });
+    let mut found: Vec<Vec<crate::ident::Symbol>> = Vec::new();
+    for model in &app.models {
+        let mut pending = crate::analyze::model_includes(model);
+        let mut seen = crate::det::HashSet::default();
+        let mut sends = crate::det::HashSet::default();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            for module in modules.get(&id).into_iter().flatten() {
+                for method in module.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance) {
+                    walk(&method.body, &mut sends);
+                }
+                pending.extend(module.includes.iter().cloned());
+            }
+        }
+        // Only the names the model's demand reads: the per-column Dirty spellings it synthesizes on demand.
+        let mut sends: Vec<_> = sends.into_iter().filter(|s| crate::lower::model_to_library::schema::is_pending_change_spelling(s.as_str())).collect();
+        sends.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        found.push(sends);
+    }
+    for (model, sends) in app.models.iter_mut().zip(found) {
+        model.mixin_sends = sends;
+    }
 }
 
 /// Drop every Validation item of each refused `validates` call, as an
@@ -3993,6 +4236,7 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
         .collect();
 
     let dependencies = concern_dependencies(app, carriers);
+    let facts = super::gem_hooks::Facts::of(app);
 
     for model in &mut app.models {
         if !only.is_empty() && !only.iter().any(|n| n == &model.name.0) {
@@ -4053,7 +4297,12 @@ fn splice_concerns_into_models_named(app: &mut App, only: &[crate::ident::Symbol
                     for i in 0..=plain.len() {
                         for g in guarded {
                             let here = if i == plain.len() { g.at >= i } else { g.at == i };
-                            if here && g.guard.admits(includer) {
+                            // Not admitted where the module's question goes unanswered: neither branch is known to run.
+                            let admitted = match &g.guard.asked {
+                                Some((module, method)) => super::gem_hooks::includer_answer(&facts, module, method, includer).is_some_and(|answer| answer != g.guard.negate),
+                                None => g.guard.admits(includer),
+                            };
+                            if here && admitted {
                                 ordered.push(&g.item);
                             }
                         }
@@ -4306,6 +4555,25 @@ pub(super) fn concern_class_method_catalog(
     class_side
 }
 
+/// A concern's class method as its includer's: the concern's bare
+/// constants are spelled so they still name its own.
+pub(super) fn concern_class_method_copy(
+    method: &crate::dialect::MethodDef,
+    concern: &crate::ident::ClassId,
+    consts: &crate::det::HashSet<Symbol>,
+) -> crate::dialect::MethodDef {
+    let mut copy = method.clone();
+    if !consts.is_empty() {
+        qualify_lexical_consts(&mut copy.body, concern, consts);
+        for param in &mut copy.params {
+            if let Some(default) = &mut param.default {
+                qualify_lexical_consts(default, concern, consts);
+            }
+        }
+    }
+    copy
+}
+
 /// Copy a concern's CLASS-side methods onto every model or library class
 /// that includes it, before analysis so receiver-relative bodies are
 /// typed against each concrete includer.
@@ -4398,16 +4666,7 @@ fn splice_concern_class_methods_into_includers(
                     continue;
                 }
                 provenance.insert(m.name.clone(), concern.clone());
-                let mut m = m.clone();
-                if !consts.is_empty() {
-                    qualify_lexical_consts(&mut m.body, concern, consts);
-                    for param in &mut m.params {
-                        if let Some(default) = &mut param.default {
-                            qualify_lexical_consts(default, concern, consts);
-                        }
-                    }
-                }
-                added.push(m);
+                added.push(concern_class_method_copy(m, concern, consts));
             }
         }
         (added, provenance)
@@ -4933,9 +5192,56 @@ fn splice_concerns_into_controllers(app: &mut App) {
                 methods.push(ControllerBodyItem::Unknown { expr: call.clone(), leading_comments: Vec::new(), leading_blank_line: false });
             }
             for method in module_methods.get(module).into_iter().flatten() {
-                if !defined.insert(method.name.clone()) {
-                    continue;
-                }
+                let renamed;
+                let method: &crate::dialect::MethodDef = if defined.insert(method.name.clone()) {
+                    method
+                } else {
+                    // Not dropped where the winning copy calls `super` (Devise's `Helpers#expire_data_after_sign_out!`
+                    // over `SignInOut`'s): Ruby runs this one there, which the flattened controller keeps under its own name.
+                    // The chain's end: the definition of the name, or a shadowed one kept under its own, that still calls `super`.
+                    let chained = |name: &crate::ident::Symbol| {
+                        *name == method.name || name.as_str().strip_prefix("__super").is_some_and(|rest| rest.ends_with(&format!("_{}", method.name.as_str())))
+                    };
+                    let Some(winner) = methods.iter_mut().chain(actions.iter_mut()).find_map(|item| match item {
+                        ControllerBodyItem::Action { action, .. } if chained(&action.name) && calls_super(&action.body) => Some(action),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    // Not a winner that forwards anonymously (`def f(...)`, `def f(**)`): its `super` passes what no name holds.
+                    if winner.anonymous_formal.is_some() {
+                        continue;
+                    }
+                    // A distinct name per level, so each shadowed definition keeps its own `super`.
+                    let Some(target) = (1..64)
+                        .map(|depth| crate::ident::Symbol::from(format!("__super{}_{}", if depth == 1 { String::new() } else { depth.to_string() }, method.name.as_str())))
+                        .find(|t| !defined.contains(t))
+                    else {
+                        continue;
+                    };
+                    defined.insert(target.clone());
+                    let var = |n: &crate::ident::Symbol| crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Var { id: crate::ident::VarId(0), name: n.clone() });
+                    // Every channel a bare `super` passes on, as Ruby's does: positional, rest, keywords and keyword rest.
+                    let mut forwarded: Vec<crate::expr::Expr> = winner.params.fields.keys().chain(winner.opt_params.iter().map(|(n, _)| n)).map(var).collect();
+                    if let Some(rest) = &winner.rest_param {
+                        forwarded.push(crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Splat { value: var(rest) }));
+                    }
+                    let mut keywords: Vec<(crate::expr::Expr, crate::expr::Expr)> = winner
+                        .kw_params
+                        .iter()
+                        .map(|(n, _)| (crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value: n.clone() } }), var(n)))
+                        .collect();
+                    if let Some(kwrest) = &winner.kwrest_param {
+                        keywords.push((crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::KeywordSplat { value: var(kwrest) }), crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil })));
+                    }
+                    if !keywords.is_empty() {
+                        forwarded.push(crate::expr::Expr::new(winner.body.span, crate::expr::ExprNode::Hash { entries: keywords, kwargs: true }));
+                    }
+                    let block = winner.block_param.as_ref().map(var);
+                    redirect_super(&mut winner.body, &target, &forwarded, block.as_ref());
+                    renamed = crate::dialect::MethodDef { name: target, ..(*method).clone() };
+                    &renamed
+                };
                 let mut body = method.body.clone();
                 if let Some(consts) = module_constants.get(module) {
                     qualify_lexical_consts(&mut body, module, consts);
@@ -5301,6 +5607,24 @@ fn answers_callback_macro(app: &App, name: &crate::ident::ClassId) -> bool {
         cur = parts.iter().find_map(|lc| lc.parent.clone()).or_else(|| model.and_then(|m| m.parent.clone()));
     }
     false
+}
+
+fn calls_super(e: &crate::expr::Expr) -> bool {
+    let mut found = matches!(&*e.node, crate::expr::ExprNode::Super { .. });
+    e.node.for_each_child(&mut |c| found |= calls_super(c));
+    found
+}
+
+/// Each `super` of a spliced method, as the call to the shadowed definition kept under `target`; a bare one passes
+/// the method's own arguments, as Ruby's does.
+fn redirect_super(e: &mut crate::expr::Expr, target: &crate::ident::Symbol, forwarded: &[crate::expr::Expr], block: Option<&crate::expr::Expr>) {
+    if let crate::expr::ExprNode::Super { args } = &*e.node {
+        let args = args.clone().unwrap_or_else(|| forwarded.to_vec());
+        // The method's own block, which `super` hands on as Ruby's does.
+        *e.node = crate::expr::ExprNode::Send { recv: None, method: target.clone(), args, block: block.cloned(), parenthesized: true };
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| redirect_super(c, target, forwarded, block));
 }
 
 /// A modelled hook has nothing left to do at load, and the emitted
@@ -5913,13 +6237,19 @@ fn is_serialization_scope_nil(method: &str, args: &[crate::expr::Expr]) -> bool 
         && matches!(args, [a] if matches!(&*a.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil }))
 }
 
+/// `respond_to :html`: what `respond_with` lowers for (`lower::controller_to_library::respond_with`).
+fn respond_to_macro_is_html_only(args: &[crate::expr::Expr]) -> bool {
+    use crate::expr::{ExprNode, Literal};
+    !args.is_empty() && args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "html"))
+}
+
 /// Class-level `respond_to :json` is consumed as a no-op when nothing
 /// in this controller's ANCESTOR CHAIN (self included) calls
 /// `respond_with` — the only thing the responders gem's `respond_to`
-/// declaration ever feeds. `respond_with` isn't modeled, so a
-/// controller that actually calls it is left to fail there (an
-/// ordinary unresolved-method error at analyze time), not silenced by
-/// this check.
+/// declaration ever feeds. `respond_with` is modeled for html-only
+/// declarations; a controller that calls it with another format is
+/// left to fail there (an ordinary unresolved-method error at analyze
+/// time), not silenced by this check.
 fn respond_to_macro_is_consumed(
     controller: &crate::dialect::Controller,
     all: &[crate::dialect::Controller],
@@ -6164,17 +6494,18 @@ fn report_unrecognized_controller_macros(app: &App) {
             }
             // Class-level `respond_to :json` (the responders gem) — a
             // pure config declaration: it names the mimes `respond_with`
-            // answers, and has no effect of its own. `respond_with`
-            // itself isn't modeled, so a controller that actually
-            // depends on it keeps failing loudly there (an ordinary
-            // unresolved-method error); this macro just configures a
-            // call nothing in the chain makes, so it's consumed as a
-            // no-op rather than flagged as an unrecognized gap. Distinct
+            // answers, and has no effect of its own. `respond_with` is
+            // modeled for html-only declarations
+            // (`lower::controller_to_library::respond_with`); for others
+            // a controller that depends on it keeps failing loudly there
+            // (an ordinary unresolved-method error). Otherwise this macro
+            // configures a call nothing in the chain makes, so it's
+            // consumed as a no-op rather than flagged as a gap. Distinct
             // from the ACTION-body `respond_to do |format| … end`
             // block, which carries a block and never reaches this
             // (blockless) branch at all.
             if method.as_str() == "respond_to"
-                && respond_to_macro_is_consumed(controller, &app.controllers)
+                && (respond_to_macro_is_html_only(args) || respond_to_macro_is_consumed(controller, &app.controllers))
             {
                 continue;
             }
@@ -7172,9 +7503,9 @@ fn filter_from_send(
         return None;
     };
     let kind = match method.as_str() {
-        "before_action" | "prepend_before_action" => FilterKind::Before,
-        "around_action" => FilterKind::Around,
-        "after_action" => FilterKind::After,
+        "before_action" | "prepend_before_action" | "append_before_action" => FilterKind::Before,
+        "around_action" | "append_around_action" => FilterKind::Around,
+        "after_action" | "append_after_action" => FilterKind::After,
         "skip_before_action" => FilterKind::Skip,
         "skip_around_action" => FilterKind::SkipAround,
         "skip_after_action" => FilterKind::SkipAfter,
@@ -8284,6 +8615,15 @@ fn map_enum_labels(app: &mut App) {
             if in_writer && kept.contains(column) {
                 continue;
             }
+            // A String mapping keeps its label: one cast turns it into the
+            // stored value later, the writer's (`enum_str`) for an
+            // assignment, and for a query the runtime relation's or, on a
+            // target without one, `lower::enum_symbols`. Mapped here as
+            // well, a stored value that is also a label (`{ queued: "sent",
+            // sent: "done" }`) was cast a second time.
+            if string_mapping(mapping) {
+                continue;
+            }
             let label = match &*value.node {
                 ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
                 ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
@@ -8292,6 +8632,12 @@ fn map_enum_labels(app: &mut App) {
             let Some((_, stored)) = mapping.iter().find(|(l, _)| *l == label) else { continue };
             *value.node = ExprNode::Lit { value: stored.clone() };
         }
+    }
+
+    /// Every stored value a String (the `nil` entry aside).
+    fn string_mapping(mapping: &[(String, Literal)]) -> bool {
+        let mut stored = mapping.iter().map(|(_, v)| v).filter(|v| !matches!(v, Literal::Nil)).peekable();
+        stored.peek().is_some() && stored.all(|v| matches!(v, Literal::Str { .. }))
     }
 
     /// Rule two: `Model.method(…)` anywhere in the app.
@@ -13308,6 +13654,38 @@ pub(super) fn queue_adapter_line(line: &str) -> Option<Option<String>> {
     Some(literal.then(|| name.to_string()))
 }
 
+/// The grammar the app's CHECKs are read under, for every reader of its
+/// schema. SQLite's own needs `config/database.yml`, as
+/// `database_configurations` resolves it, to say SQLite throughout: the
+/// test environment has a primary, every configuration names sqlite3, and
+/// none was left out as unresolved or takes a computed `url:`. A file that
+/// says less, or no file, keeps the portable grammar, since some database
+/// of the app may not be SQLite. So does a file whose pragmas may set
+/// `case_sensitive_like`, to either value: Rails runs it on connect, and
+/// it decides what `LIKE` matches.
+///
+/// A file that names another adapter for any configuration (postgresql,
+/// mysql2, trilogy, ...) gives `OtherDatabase`: the portable grammar, with
+/// what it can't read left out of the schema and warned about rather than
+/// refused, since that text may be the other database's own SQL.
+fn schema_expression_dialect<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::schema::generated::GeneratedExpressionDialect {
+    use crate::schema::generated::GeneratedExpressionDialect::{OtherDatabase, Portable, Sqlite};
+    let Ok(text) = vfs.read_to_string(&dir.join("config/database.yml")) else { return Portable };
+    let read = super::database_yml::database_configurations(&text, crate::span::FileId(0));
+    let sqlite = read.refusals.is_empty()
+        && !read.computed_url
+        && !read.case_sensitive_like
+        && read.databases.iter().any(|d| d.env == "test" && d.primary)
+        && read.databases.iter().all(|d| d.adapter == crate::database::DatabaseAdapter::Sqlite3);
+    if sqlite {
+        Sqlite
+    } else if read.databases.iter().any(|d| d.adapter != crate::database::DatabaseAdapter::Sqlite3) {
+        OtherDatabase
+    } else {
+        Portable
+    }
+}
+
 /// Use the ordinary schema readers for selection too. The normal primary schema
 /// pass remains the owner of its facts and diagnostics, including survey gaps.
 fn primary_schema_has_queue<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
@@ -13317,7 +13695,7 @@ fn primary_schema_has_queue<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
     let marks = (super::survey::mark(), super::prism::mark());
     let file = path.display().to_string();
     let schema = if path.extension().is_some_and(|ext| ext == "rb") {
-        ingest_schema(&source, &file)
+        ingest_schema_with_generated_expression_dialect(&source, &file, schema_expression_dialect(vfs, dir))
     } else {
         ingest_structure_sql(&source, &file)
     };
@@ -13405,8 +13783,8 @@ fn effective_queue_adapter<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<Strin
 /// job that inherits it, so it overrides the config files' setting, the
 /// last assignment winning, and a value that isn't a literal leaves the
 /// adapter unknown, as in `read_queue_adapter`. Another job class's own
-/// setting is not honored yet: its jobs follow the app's adapter, with a
-/// warning.
+/// durable setting is not honored yet: its jobs follow the app's adapter,
+/// with a warning. The class-side lowering honors literal inline/test adapters.
 fn apply_application_job_queue_adapter(app: &mut App) {
     let mut set: Option<Option<String>> = None;
     for lc in &app.library_classes {
@@ -13415,9 +13793,22 @@ fn apply_application_job_queue_adapter(app: &mut App) {
             let Some(value) = job_queue_adapter(call) else { continue };
             if name == "ApplicationJob" {
                 set = Some(value);
-            } else {
+            } else if !matches!(value.as_deref(), Some("inline" | "test")) {
                 warn_sidekiq(format!(
                     "`self.queue_adapter =` in {name} is not honored yet (only ApplicationJob's is read); its jobs use the app's adapter"
+                ));
+            } else if let Some(heir) = app.library_classes.iter().find(|other| {
+                other.parent.as_ref().is_some_and(|p| p.0.as_str().trim_start_matches("::") == name)
+                    && !app.library_classes.iter().any(|same| {
+                        same.name == other.name && same.unknown_calls.iter().any(|c| job_queue_adapter(c).is_some())
+                    })
+            }) {
+                // The class-side lowering honors a literal inline/test
+                // adapter on the job that sets it, not on a subclass that
+                // inherits it: that subclass's jobs still use the app's.
+                warn_sidekiq(format!(
+                    "`self.queue_adapter =` in {name} is honored for {name} only; {} inherits it and its jobs use the app's adapter",
+                    heir.name.0.as_str()
                 ));
             }
         }
@@ -13446,8 +13837,12 @@ fn job_queue_adapter(call: &crate::expr::Expr) -> Option<Option<String>> {
 /// `App::sidekiq_redis`: the `Sidekiq.configure_client` Redis settings
 /// in `config/initializers`, the last block that sets them winning, as it
 /// does when Rails runs the initializers in order.
-fn read_sidekiq_redis<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::app::SidekiqRedisConfig {
-    let mut config = crate::app::SidekiqRedisConfig::default();
+///
+/// Also the settings that block gives that can't be honored, each a
+/// message: errors on a tree that ends up on `:sidekiq`, warnings on any
+/// other.
+fn read_sidekiq_redis<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> (crate::app::SidekiqRedisConfig, Vec<String>) {
+    let mut config = (crate::app::SidekiqRedisConfig::default(), Vec::new());
     let init = dir.join("config/initializers");
     if !vfs.is_dir(&init) {
         return config;
@@ -13461,15 +13856,16 @@ fn read_sidekiq_redis<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::app::Sidek
     config
 }
 
-/// The `url:` and `password:` a file's `Sidekiq.configure_client do
-/// |config| config.redis = { … } end` gives, `None` when the file has no
-/// such assignment. Only those two keys are read, each as a String
-/// literal, `ENV["NAME"]` or `ENV.fetch("NAME"[, "default"])`. Any other
-/// key, a value in another form, or a `config.redis =` that isn't a Hash
-/// literal is a warning, and the setting is not read. A tree on
-/// `:sidekiq` whose blocks leave it no `url:` is an error
-/// (`require_sidekiq_redis_url`): there is no environment fallback.
-pub(super) fn sidekiq_client_redis(source: &[u8], file: &str) -> Option<crate::app::SidekiqRedisConfig> {
+/// The Redis settings a file's `Sidekiq.configure_client do |config|
+/// config.redis = { … } end` gives, `None` when the file has no such
+/// assignment, with the messages for the keys that can't be honored
+/// (`sidekiq_redis_key` says which key does what). A key that changes
+/// nothing here, an unknown key, a `url:` or `password:` in a form
+/// ingest doesn't read, or a `config.redis =` that isn't a Hash literal
+/// is a warning. A tree on `:sidekiq` whose blocks leave it no `url:` is
+/// an error (`require_sidekiq_redis_url`): there is no environment
+/// fallback.
+pub(super) fn sidekiq_client_redis(source: &[u8], file: &str) -> Option<(crate::app::SidekiqRedisConfig, Vec<String>)> {
     let src = String::from_utf8_lossy(source);
     // Cheap skip before parsing, as `kaminari_default_per_page` does.
     if !src.contains("configure_client") {
@@ -13520,14 +13916,18 @@ pub(super) fn sidekiq_client_redis(source: &[u8], file: &str) -> Option<crate::a
             let args: Vec<_> = args.arguments().iter().collect();
             let [value] = args.as_slice() else { continue };
             let mut config = crate::app::SidekiqRedisConfig::default();
+            let mut refused = Vec::new();
             let Some(hash) = value.as_hash_node() else {
                 warn_sidekiq(format!(
                     "`{param}.redis = {}` in {file} is not a Hash literal, so it is not read",
                     text(value)
                 ));
-                found = Some(config);
+                found = Some((config, refused));
                 continue;
             };
+            // Sidekiq maps `network_timeout:` onto `timeout:` after its
+            // own `timeout ||= 3`, so it wins wherever it is written.
+            let mut network_timeout = None;
             for element in hash.elements().iter() {
                 let Some(pair) = element.as_assoc_node() else {
                     warn_sidekiq(format!("`{}` in {file}'s Sidekiq Redis settings is not read", text(&element)));
@@ -13537,33 +13937,186 @@ pub(super) fn sidekiq_client_redis(source: &[u8], file: &str) -> Option<crate::a
                     warn_sidekiq(format!("`{}` in {file}'s Sidekiq Redis settings is not read", text(&element)));
                     continue;
                 };
-                if key != "url" && key != "password" {
-                    warn_sidekiq(format!(
-                        "Sidekiq Redis setting `{key}:` in {file} is not supported yet (only url: and password: are read); it is ignored"
-                    ));
-                    continue;
-                }
                 let value = pair.value();
-                let Some(setting) = redis_setting(&value, &src) else {
-                    warn_sidekiq(format!(
-                        "Sidekiq Redis `{key}: {}` in {file} is not a String literal, ENV[\"NAME\"] or ENV.fetch(\"NAME\"); it is ignored",
-                        text(&value)
-                    ));
-                    continue;
-                };
-                if key == "url" {
-                    config.url = Some(setting);
-                } else {
-                    config.password = Some(setting);
+                let shown = format!("`{key}: {}` in {file}", text(&value));
+                match sidekiq_redis_key(&key, &value, &src) {
+                    RedisKey::Url(setting) => config.url = Some(setting),
+                    RedisKey::Password(setting) => config.password = Some(setting),
+                    RedisKey::Username(setting) => config.username = Some(setting),
+                    RedisKey::Db(setting) => config.db = Some(setting),
+                    RedisKey::Timeout(seconds) => config.timeout = Some(seconds),
+                    RedisKey::NetworkTimeout(seconds) => network_timeout = Some(seconds),
+                    RedisKey::ConnectTimeout(seconds) => config.connect_timeout = Some(seconds),
+                    RedisKey::ReadTimeout(seconds) => config.read_timeout = Some(seconds),
+                    RedisKey::ReconnectAttempts(delays) => config.reconnect_attempts = delays,
+                    RedisKey::AsHere => {}
+                    RedisKey::Unread(why) => {
+                        warn_sidekiq(format!("Sidekiq Redis {shown} is not read: {why}; it is ignored"));
+                    }
+                    RedisKey::Ignored(why) => {
+                        warn_sidekiq(format!("Sidekiq Redis setting `{key}:` in {file} is ignored: {why}"));
+                    }
+                    RedisKey::Refused(why) => {
+                        refused.push(format!("Sidekiq Redis setting `{key}:` in {file} can't be honored: {why}"));
+                    }
+                    RedisKey::Unknown => warn_sidekiq(format!(
+                        "Sidekiq Redis setting `{key}:` in {file} is not supported; it is ignored"
+                    )),
                 }
             }
-            found = Some(config);
+            if network_timeout.is_some() {
+                config.timeout = network_timeout;
+            }
+            found = Some((config, refused));
         }
     }
     found
 }
 
+/// What one key of a `configure_client` `config.redis = { … }` Hash
+/// does here, keyed as Sidekiq 8.1.7 hands it to redis-client.
+enum RedisKey {
+    /// `url:` and `password:`, each a String literal or a variable.
+    Url(crate::app::RedisSetting),
+    Password(crate::app::RedisSetting),
+    Username(crate::app::RedisSetting),
+    Db(crate::app::RedisSetting),
+    Timeout(f64),
+    NetworkTimeout(f64),
+    ConnectTimeout(f64),
+    ReadTimeout(f64),
+    /// `None` keeps Sidekiq's default of one retry.
+    ReconnectAttempts(Option<Vec<f64>>),
+    /// A value that asks for what the push already does (`id: nil`,
+    /// `ssl: false`, `protocol: 3`).
+    AsHere,
+    /// A key that is read but changes nothing here, with the reason.
+    Ignored(&'static str),
+    /// A key this pipeline can't honor: an error on `:sidekiq`, where
+    /// ignoring it would connect somewhere, or some way, the app didn't
+    /// ask for.
+    Refused(String),
+    /// A `url:` or `password:` in a form ingest doesn't read.
+    Unread(&'static str),
+    Unknown,
+}
+
+fn sidekiq_redis_key(key: &str, value: &Node<'_>, src: &str) -> RedisKey {
+    const STRING_FORMS: &str = "it is not a String literal, ENV[\"NAME\"] or ENV.fetch(\"NAME\"[, \"default\"])";
+    const TLS: &str = "TLS is not supported, since Spinel's sp_net has no TLS yet (matz/spinel#1054); \
+                       use a redis:// URL, through a local TLS proxy such as stunnel if the server needs TLS";
+    const SENTINEL: &str = "Redis Sentinel is not supported: the client connects to the one host in url:";
+    let seconds = |key: &str| match number_value(value) {
+        Some(n) if n > 0.0 => Ok(n),
+        _ => Err(RedisKey::Refused(format!(
+            "`{key}:` must be a positive Integer or Float literal, or a Duration literal such as 5.seconds"
+        ))),
+    };
+    let nil_or_false = value.as_nil_node().is_some() || value.as_false_node().is_some();
+    match key {
+        "url" | "password" => {
+            let Some(setting) = redis_setting(value, src) else { return RedisKey::Unread(STRING_FORMS) };
+            if key == "url" { RedisKey::Url(setting) } else { RedisKey::Password(setting) }
+        }
+        "username" => match redis_setting(value, src) {
+            Some(setting) => RedisKey::Username(setting),
+            None => RedisKey::Refused(
+                "`username:` must be a String literal, ENV[\"NAME\"] or ENV.fetch(\"NAME\"[, \"default\"])".to_string(),
+            ),
+        },
+        "db" => match super::util::integer_value(value) {
+            Some(n) if n >= 0 => RedisKey::Db(crate::app::RedisSetting::Literal(n.to_string())),
+            Some(_) => RedisKey::Refused("`db:` must not be negative".to_string()),
+            None => match redis_setting(value, src) {
+                // A String literal is emitted as an Integer literal, so it
+                // must read as one in plain decimal: `"08"` would emit `08`,
+                // which Ruby refuses, and `"010"` would be octal.
+                Some(crate::app::RedisSetting::Literal(text)) => match decimal_db(&text) {
+                    Some(n) => RedisKey::Db(crate::app::RedisSetting::Literal(n.to_string())),
+                    None => RedisKey::Refused(
+                        "`db:` must be an Integer, written in decimal without leading zeros".to_string(),
+                    ),
+                },
+                Some(setting) => RedisKey::Db(setting),
+                None => RedisKey::Refused(
+                    "`db:` is read only as an Integer literal, ENV[\"NAME\"] or ENV.fetch(\"NAME\"[, \"default\"])".to_string(),
+                ),
+            },
+        },
+        "timeout" => seconds(key).map_or_else(|e| e, RedisKey::Timeout),
+        "network_timeout" => seconds(key).map_or_else(|e| e, RedisKey::NetworkTimeout),
+        "connect_timeout" => seconds(key).map_or_else(|e| e, RedisKey::ConnectTimeout),
+        "read_timeout" => seconds(key).map_or_else(|e| e, RedisKey::ReadTimeout),
+        // Sidekiq's `reconnect_attempts ||= 1` turns `nil` and `false`
+        // into one retry; only 0 (or `[]`) turns retrying off.
+        "reconnect_attempts" => {
+            if nil_or_false {
+                return RedisKey::ReconnectAttempts(None);
+            }
+            if let Some(n) = super::util::integer_value(value).filter(|n| (0..=100).contains(n)) {
+                return RedisKey::ReconnectAttempts(Some(vec![0.0; n as usize]));
+            }
+            let delays: Option<Vec<f64>> = value
+                .as_array_node()
+                .and_then(|array| array.elements().iter().map(|e| number_value(&e).filter(|n| *n >= 0.0)).collect());
+            match delays {
+                Some(delays) => RedisKey::ReconnectAttempts(Some(delays)),
+                None => RedisKey::Refused(
+                    "`reconnect_attempts:` must be an Integer literal from 0 to 100 or an Array of literal delays in seconds".to_string(),
+                ),
+            }
+        }
+        // redis-client names the connection with `CLIENT SETNAME`, which
+        // the push doesn't send. `id: nil` (the old way to turn Sidekiq 6's
+        // naming off) asks for exactly that.
+        "id" if value.as_nil_node().is_some() => RedisKey::AsHere,
+        "id" => RedisKey::Refused(
+            "naming the connection needs CLIENT SETNAME, which spinel-redis does not send yet; leave `id:` out or set it to nil".to_string(),
+        ),
+        "ssl" if nil_or_false => RedisKey::AsHere,
+        "ssl" | "ssl_params" => RedisKey::Refused(TLS.to_string()),
+        "sentinels" | "role" | "name" | "master_name" | "sentinel_username" | "sentinel_password" => {
+            RedisKey::Refused(SENTINEL.to_string())
+        }
+        "path" => RedisKey::Refused("unix sockets are not supported; use a redis://host:port URL".to_string()),
+        // redis-client lets an explicit `host:` or `port:` win over the
+        // URL's, so ignoring one would connect to another server.
+        "host" | "port" => RedisKey::Refused(format!("`{key}:` overrides url:'s, and is not read; put it in url:")),
+        "namespace" => RedisKey::Refused("Sidekiq 7 and later raise for a namespace; drop it".to_string()),
+        "nodes" => RedisKey::Refused("Redis Cluster is not supported, as Sidekiq itself refuses it".to_string()),
+        "protocol" if super::util::integer_value(value) == Some(3) => RedisKey::AsHere,
+        "protocol" => RedisKey::Refused("Sidekiq 7 and later speak only RESP3 (`protocol: 3`)".to_string()),
+        "size" | "pool_timeout" | "pool_name" => RedisKey::Ignored(
+            "there is no connection pool: pushes share one connection per process, and the worker opens one per thread",
+        ),
+        "driver" => RedisKey::Ignored("the client is spinel-redis on spinel and redis-rb on ruby and jruby"),
+        "write_timeout" => RedisKey::Ignored("spinel-redis has no write timeout, so a write waits until the socket takes it"),
+        "logger" => RedisKey::Ignored("the boot line is the only connection log"),
+        _ => RedisKey::Unknown,
+    }
+}
+
+/// A number literal: an Integer, a Float, or a Duration literal's seconds.
+fn number_value(node: &Node<'_>) -> Option<f64> {
+    if let Some(n) = super::util::integer_value(node) {
+        return Some(n as f64);
+    }
+    if let Some(n) = node.as_float_node().map(|f| f.value()).filter(|n| n.is_finite()) {
+        return Some(n);
+    }
+    super::util::duration_seconds(node).map(|n| n as f64)
+}
+
 /// A Redis setting's value as `RedisSetting` reads it.
+/// A `db:` given as a String literal, read as the Integer it names: plain
+/// decimal digits, `"0"` or no leading zero, and small enough for an i64.
+fn decimal_db(text: &str) -> Option<i64> {
+    let decimal = !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    if decimal { text.parse().ok() } else { None }
+}
+
 fn redis_setting(node: &Node<'_>, src: &str) -> Option<crate::app::RedisSetting> {
     use crate::app::RedisSetting;
     if let Some(literal) = string_literal_value(node) {
@@ -13612,6 +14165,12 @@ fn require_sidekiq_redis_url(app: &App) {
         "Sidekiq",
         detail,
     ));
+}
+
+/// An error for a Sidekiq setting, on a tree on `:sidekiq`, that can't
+/// be honored.
+fn refuse_sidekiq(detail: String) {
+    super::prism::push(crate::diagnostic::Diagnostic::unsupported(crate::span::Span::synthetic(), None, "Sidekiq", detail));
 }
 
 /// A warning about what ingest reads from the app's Sidekiq settings.
@@ -14653,3 +15212,28 @@ mod path_gem_vfs_tests {
 }
 
 
+
+/// Rails' `Mime::EXTENSION_LOOKUP[ext]` (devise's `navigational_formats`), the registered type for an extension
+/// or nil: what `Mime::Type.lookup_by_extension(ext)` answers in the runtime, which has no such table, in every body
+/// the tree emits (a `direct` route helper's too). Only that read: any other use of the table stays the unknown
+/// constant it is.
+fn mime_extension_lookups(app: &mut App) {
+    use crate::expr::{Expr, ExprNode};
+    use crate::ident::Symbol;
+    fn rewrite(e: &mut Expr) {
+        if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *e.node
+            && method.as_str() == "[]"
+            && args.len() == 1
+            && matches!(&*recv.node, ExprNode::Const { path } if path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).eq(["Mime", "EXTENSION_LOOKUP"]))
+        {
+            let span = recv.span;
+            let mut constant = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("Mime"), Symbol::from("Type")] });
+            // Not resolved where it stands: the source names `Mime::EXTENSION_LOOKUP` there, not this.
+            constant.decisions |= crate::expr::GENERATED_CONST_REF;
+            *recv = constant;
+            *method = Symbol::from("lookup_by_extension");
+        }
+        e.node.for_each_child_mut(&mut rewrite);
+    }
+    crate::lower::for_each_emit_body(app, &mut rewrite);
+}

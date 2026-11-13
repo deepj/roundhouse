@@ -416,7 +416,13 @@ pub(super) fn emit_view_helper_call(kind: &ViewHelperKind<'_>, ctx: &ViewCtx) ->
                 Some(inline) => inline,
                 None => {
                     let label = pre_escaped.clone().unwrap_or_else(|| lit_str_coerce(lowered.clone()));
-                    let mut args = vec![label, rewrite_helpers_in_expr(url, ctx)];
+                    // `:back` is Rails' `url_for(:back)`, the referrer, not a String to escape.
+                    let href = if matches!(&*url.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "back") {
+                        view_helpers_call("back_url", Vec::new())
+                    } else {
+                        rewrite_helpers_in_expr(url, ctx)
+                    };
+                    let mut args = vec![label, href];
                     if let Some(o) = opts {
                         args.push((*o).clone());
                     }
@@ -1320,6 +1326,9 @@ fn nested_element_parts(kind: &NestedUrlElement<'_>) -> (String, Expr) {
 /// helper whose body the app wrote, an app helper of the name or a
 /// `direct` route, which reads the record.
 pub(super) fn rewrite_path_args(helper: &str, args: &[Expr], ctx: &ViewCtx) -> Vec<Expr> {
+    if ctx.direct_route_helpers.contains(helper) {
+        return args.to_vec();
+    }
     let resource = helper.trim_end_matches("_path").trim_end_matches("_url");
     let resource = resource.strip_prefix("edit_").unwrap_or(resource);
     let param = if args.len() == 1 && ctx.slug_models.iter().any(|m| m == resource) { "to_param" } else { "id" };
