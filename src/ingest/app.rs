@@ -2884,7 +2884,7 @@ end
         locales.push("en".to_string());
         locales
     });
-    skip_non_locale_segments(&mut app, &lone_segments)?;
+    skip_non_locale_segments(&mut app, &lone_segments, implicit.as_deref())?;
     super::locale_templates::merge(&mut app, implicit.as_deref());
 
     // `sig/**/*.rbs` — user-authored RBS sidecars for app code the
@@ -9210,8 +9210,11 @@ pub(super) struct LoneSegment {
 /// whose segment no available locale names and is not shaped like one
 /// (`show.foo.erb`, or `show.zh-Hans.erb` without `zh-Hans`) is skipped
 /// as the walker skips a format it does not take, and leaves no view.
-pub(super) fn skip_non_locale_segments(app: &mut App, lone: &[LoneSegment]) -> IngestResult<()> {
-    let available = app.i18n.locales();
+/// `implicit`, with `available_locales` unset, is the locales the gems'
+/// files make available besides the app's.
+pub(super) fn skip_non_locale_segments(app: &mut App, lone: &[LoneSegment], implicit: Option<&[String]>) -> IngestResult<()> {
+    let mut available = app.i18n.locales();
+    available.extend(implicit.unwrap_or_default().iter().cloned());
     let mut skipped: HashSet<String> = HashSet::default();
     for t in lone.iter().filter(|t| !super::locale_templates::names_locale(&t.segment, &available)) {
         record_skipped_view(&t.path, &format!("{} (non-html format)", t.handler))?;

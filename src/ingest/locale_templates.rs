@@ -68,7 +68,8 @@ struct Member {
 /// locales Rails makes available from files other than the app's (its
 /// gems', and its own `en`), which `app.i18n` does not list.
 pub(super) fn merge(app: &mut App, implicit: Option<&[String]>) {
-    let available = app.i18n.locales();
+    let mut available = app.i18n.locales();
+    available.extend(implicit.unwrap_or_default().iter().cloned());
     // Each view by the name, format and kind it answers to once its
     // locale is read off.
     let mut groups: Vec<((String, String, bool), Vec<Member>)> = Vec::new();

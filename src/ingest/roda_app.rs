@@ -212,7 +212,7 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
                 app.views.push(view);
             }
         }
-        skip_non_locale_segments(&mut app, &lone_segments)?;
+        skip_non_locale_segments(&mut app, &lone_segments, None)?;
         for view in &mut app.views {
             if let Some(locals) = part_locals.get(view.name.as_str()) {
                 view.strict_locals = Some(

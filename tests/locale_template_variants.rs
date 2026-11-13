@@ -439,6 +439,21 @@ fn a_locale_only_a_gem_makes_available_finds_its_parents_template() {
     assert!(!welcome.contains("\"fr\""), "{welcome}");
 }
 
+/// A lone segment only a gem's locale file names, with
+/// `available_locales` unset, is a locale as one the app's files name
+/// is: `greeting.zh-Hans.erb` is not skipped, and like any template in
+/// a locale only another file makes available, it is an error.
+#[test]
+fn a_lone_segment_only_a_gem_makes_available_is_a_locale() {
+    let app = greeting_files("    config.i18n.default_locale = :en\n")
+        .into_iter()
+        .fold(emit_and_run::empty_app(), |app, (path, body)| app.write(&path, &body));
+    let errors = locale_template_errors(
+        with_widgets_gem(app).write("engines/widgets/config/locales/widgets.yml", "zh-Hans:\n  widgets: \"Widgets\"\n"),
+    );
+    assert!(errors.iter().any(|e| e.contains("`pages/greeting`") && e.contains("makes `zh-Hans` available")), "{errors:#?}");
+}
+
 /// `greeting.zh-Hans.erb`, against Rails 8.1.4.
 #[test]
 fn rails_reads_a_lone_segment_available_locales_names() {
