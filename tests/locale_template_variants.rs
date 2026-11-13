@@ -459,13 +459,17 @@ fn a_block_render_of_a_partial_whose_locale_templates_each_yield_once() {
 
 /// A captured block is Rails' answer only when every locale's template
 /// yields once: a `de` template that does not yield would run the block
-/// where Rails doesn't, and a `when` that yields runs it again before the
-/// arm's own `yield`. Both are refused.
+/// where Rails doesn't, and so would a `when` that yields, which runs
+/// only until an earlier arm matches (and runs it again before the arm's
+/// own `yield` when none does), or a `case` without `else`, which yields
+/// nothing for a value no arm matches. All are refused.
 #[test]
 fn a_block_render_of_a_partial_whose_locale_templates_yield_otherwise_is_refused() {
     for (default, de) in [
         ("<div><%= yield %></div>\n", "<section>none</section>\n"),
         ("<%= case \"x\" when yield then yield else yield end %>\n", "<section><%= yield %></section>\n"),
+        ("<%= case \"x\" when \"x\" then \"a\" when yield then \"b\" else \"c\" end %>\n", "<section><%= yield %></section>\n"),
+        ("<%= case \"x\" when \"x\" then yield end %>\n", "<section><%= yield %></section>\n"),
     ] {
         let errors = app(false)
             .write("app/views/pages/about_de.html.erb", "<%= render \"wrapper\" do %><b>Body</b><% end %>\n")

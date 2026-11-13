@@ -260,8 +260,7 @@ fn unmodeled_block_renders(app: &App) -> Vec<Diagnostic> {
     // (`form_with … do |form|`, `content_tag … do`) yields once, and a
     // `case` runs one arm (a partial's locale templates, merged into a
     // `case I18n.locale`), so it yields as often as each arm does when
-    // they all agree. Its `when` conditions and guards may each run, so
-    // their yields all count.
+    // they all agree.
     fn yields(e: &Expr, nested: bool, count: &mut usize, in_block: &mut bool) {
         fn pattern_yields(p: &Pattern, nested: bool, count: &mut usize, in_block: &mut bool) {
             match p {
@@ -279,10 +278,11 @@ fn unmodeled_block_renders(app: &App) -> Vec<Diagnostic> {
         }
         if let ExprNode::Case { scrutinee, arms } = &*e.node {
             yields(scrutinee, nested, count, in_block);
+            let mut conditions = 0;
             for arm in arms {
-                pattern_yields(&arm.pattern, nested, count, in_block);
+                pattern_yields(&arm.pattern, nested, &mut conditions, in_block);
                 if let Some(guard) = &arm.guard {
-                    yields(guard, nested, count, in_block);
+                    yields(guard, nested, &mut conditions, in_block);
                 }
             }
             let mut bodies: Vec<usize> = arms
@@ -299,8 +299,11 @@ fn unmodeled_block_renders(app: &App) -> Vec<Diagnostic> {
             }
             // Arms that disagree (a locale's template that does not yield
             // beside one that does) would run the captured block where Rails
-            // doesn't: counted as more than once, which is refused.
-            *count += if bodies.iter().all(|n| *n == bodies[0]) { bodies[0] } else { 2 };
+            // doesn't, and so would a yield in a `when` condition, which runs
+            // only until an arm matches: counted as more than once, which is
+            // refused.
+            let agree = bodies.iter().all(|n| *n == bodies[0]);
+            *count += if conditions == 0 && agree { bodies[0] } else { 2 };
             return;
         }
         let iterates = match &*e.node {
