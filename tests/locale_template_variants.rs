@@ -457,6 +457,28 @@ fn a_block_render_of_a_partial_whose_locale_templates_each_yield_once() {
         .assert_passes();
 }
 
+/// A captured block is Rails' answer only when every locale's template
+/// yields once: a `de` template that does not yield would run the block
+/// where Rails doesn't, and a `when` that yields runs it again before the
+/// arm's own `yield`. Both are refused.
+#[test]
+fn a_block_render_of_a_partial_whose_locale_templates_yield_otherwise_is_refused() {
+    for (default, de) in [
+        ("<div><%= yield %></div>\n", "<section>none</section>\n"),
+        ("<%= case \"x\" when yield then yield else yield end %>\n", "<section><%= yield %></section>\n"),
+    ] {
+        let errors = app(false)
+            .write("app/views/pages/about_de.html.erb", "<%= render \"wrapper\" do %><b>Body</b><% end %>\n")
+            .write("app/views/pages/_wrapper.html.erb", default)
+            .write("app/views/pages/_wrapper.de.html.erb", de)
+            .check_errors();
+        assert!(
+            errors.iter().any(|e| e.contains("render with a block not supported") && e.contains("yield exactly once")),
+            "{default}: {errors:#?}"
+        );
+    }
+}
+
 /// A lone segment only a gem's locale file names, with
 /// `available_locales` unset, is a locale as one the app's files name
 /// is: `greeting.zh-Hans.erb` is not skipped, and like any template in

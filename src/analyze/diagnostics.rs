@@ -7,7 +7,7 @@
 use crate::App;
 use crate::ide::render_ty;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::expr::{Expr, ExprNode, LValue};
+use crate::expr::{Expr, ExprNode, LValue, Pattern};
 use crate::ty::Ty;
 use crate::ident::{ClassId, Symbol};
 use crate::det::HashMap;
@@ -259,8 +259,18 @@ fn unmodeled_block_renders(app: &App) -> Vec<Diagnostic> {
     // block of a method that runs it per element. A block run once
     // (`form_with … do |form|`, `content_tag … do`) yields once, and a
     // `case` runs one arm (a partial's locale templates, merged into a
-    // `case I18n.locale`), so it yields as often as its most yielding arm.
+    // `case I18n.locale`), so it yields as often as each arm does when
+    // they all agree. Its `when` conditions and guards may each run, so
+    // their yields all count.
     fn yields(e: &Expr, nested: bool, count: &mut usize, in_block: &mut bool) {
+        fn pattern_yields(p: &Pattern, nested: bool, count: &mut usize, in_block: &mut bool) {
+            match p {
+                Pattern::Expr { expr } => yields(expr, nested, count, in_block),
+                Pattern::Array { elems, .. } => elems.iter().for_each(|p| pattern_yields(p, nested, count, in_block)),
+                Pattern::Record { fields, .. } => fields.iter().for_each(|(_, p)| pattern_yields(p, nested, count, in_block)),
+                Pattern::Wildcard | Pattern::Bind { .. } | Pattern::Lit { .. } => {}
+            }
+        }
         if let ExprNode::Yield { args } = &*e.node
             && args.is_empty()
         {
@@ -269,16 +279,28 @@ fn unmodeled_block_renders(app: &App) -> Vec<Diagnostic> {
         }
         if let ExprNode::Case { scrutinee, arms } = &*e.node {
             yields(scrutinee, nested, count, in_block);
-            let mut most = 0;
             for arm in arms {
-                let mut n = 0;
+                pattern_yields(&arm.pattern, nested, count, in_block);
                 if let Some(guard) = &arm.guard {
-                    yields(guard, nested, &mut n, in_block);
+                    yields(guard, nested, count, in_block);
                 }
-                yields(&arm.body, nested, &mut n, in_block);
-                most = most.max(n);
             }
-            *count += most;
+            let mut bodies: Vec<usize> = arms
+                .iter()
+                .map(|arm| {
+                    let mut n = 0;
+                    yields(&arm.body, nested, &mut n, in_block);
+                    n
+                })
+                .collect();
+            // No `else`: a value no arm matches runs none.
+            if !arms.iter().any(|arm| matches!(arm.pattern, Pattern::Wildcard)) {
+                bodies.push(0);
+            }
+            // Arms that disagree (a locale's template that does not yield
+            // beside one that does) would run the captured block where Rails
+            // doesn't: counted as more than once, which is refused.
+            *count += if bodies.iter().all(|n| *n == bodies[0]) { bodies[0] } else { 2 };
             return;
         }
         let iterates = match &*e.node {
