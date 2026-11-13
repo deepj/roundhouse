@@ -257,13 +257,29 @@ fn unmodeled_block_renders(app: &App) -> Vec<Diagnostic> {
     use crate::lower::view::{classify_render_partial, RenderPartial};
     // Bare `yield`s, and whether any sits inside a loop: a `while`, or the
     // block of a method that runs it per element. A block run once
-    // (`form_with … do |form|`, `content_tag … do`) yields once.
+    // (`form_with … do |form|`, `content_tag … do`) yields once, and a
+    // `case` runs one arm (a partial's locale templates, merged into a
+    // `case I18n.locale`), so it yields as often as its most yielding arm.
     fn yields(e: &Expr, nested: bool, count: &mut usize, in_block: &mut bool) {
         if let ExprNode::Yield { args } = &*e.node
             && args.is_empty()
         {
             *count += 1;
             *in_block |= nested;
+        }
+        if let ExprNode::Case { scrutinee, arms } = &*e.node {
+            yields(scrutinee, nested, count, in_block);
+            let mut most = 0;
+            for arm in arms {
+                let mut n = 0;
+                if let Some(guard) = &arm.guard {
+                    yields(guard, nested, &mut n, in_block);
+                }
+                yields(&arm.body, nested, &mut n, in_block);
+                most = most.max(n);
+            }
+            *count += most;
+            return;
         }
         let iterates = match &*e.node {
             ExprNode::While { .. } => true,

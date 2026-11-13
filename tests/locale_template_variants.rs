@@ -439,6 +439,24 @@ fn a_locale_only_a_gem_makes_available_finds_its_parents_template() {
     assert!(!welcome.contains("\"fr\""), "{welcome}");
 }
 
+/// A partial whose locale templates each yield once yields once: the
+/// merged `case I18n.locale` runs one arm, so `render "wrapper" do … end`
+/// renders the block in the locale's template.
+#[test]
+fn a_block_render_of_a_partial_whose_locale_templates_each_yield_once() {
+    app(false)
+        .write("app/views/pages/about_de.html.erb", "<%= render \"wrapper\" do %><b>Body</b><% end %>\n")
+        .write("app/views/pages/_wrapper.html.erb", "<div><%= yield %></div>\n")
+        .write("app/views/pages/_wrapper.de.html.erb", "<section><%= yield %></section>\n")
+        .run_ruby(&format!(
+            "require \"stringio\"\ndef req(env)\n  status, _headers, body = Main.run_rack({RACK_ENV})\n  text = +\"\"\n  body.each {{ |part| text << part }}\n  status == 200 ? text.gsub(/\\s*\\n\\s*/, \"\") : \"!#{{status}}\"\nend\n\
+             got = [req([\"about_de\", \"locale=en\"]), req([\"about_de\", \"locale=de\"]), req([\"about_de\", \"locale=de-AT\"])]\n\
+             want = [\"[en]<div><b>Body</b></div>\", \"[de]<section><b>Body</b></section>\", \"[de]<section><b>Body</b></section>\"]\n\
+             raise got.inspect unless got == want\nputs \"PASS\"\n"
+        ))
+        .assert_passes();
+}
+
 /// A lone segment only a gem's locale file names, with
 /// `available_locales` unset, is a locale as one the app's files name
 /// is: `greeting.zh-Hans.erb` is not skipped, and like any template in
